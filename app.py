@@ -79,19 +79,41 @@ class Telemetry:
         self.samples.setdefault(key, []).append(value)
 
     def start(self, span, parent=None, service=None):
+        # 先完成全部校验再写入：service 规则与不可哈希标识一律 ValueError；
+        # 相同 (service, span) 已存在（无论是否已结束）也拒绝，不覆盖原有
+        # parent/start/end/error，也不推进 clock。
         service = self._service(service)
-        self.spans[(service, span)] = {
+        self._restore_hashable(span, "span")
+        key = (service, span)
+        if key in self.spans:
+            raise ValueError(
+                "span already exists for service=%r span=%r" % (service, span)
+            )
+        self.spans[key] = {
             "parent": parent,
             "start": self.clock(),
             "end": None,
             "error": None,
         }
+        return None
 
     def finish(self, span, error=None, service=None):
+        # 只允许结束当前存在且 end 仍为空的跨度；找不到或已结束都抛
+        # ValueError，且不产生新的时间戳、不改动任何聚合数据。
         service = self._service(service)
-        record = self.spans[(service, span)]
+        self._restore_hashable(span, "span")
+        record = self.spans.get((service, span))
+        if record is None:
+            raise ValueError(
+                "no such span for service=%r span=%r" % (service, span)
+            )
+        if record["end"] is not None:
+            raise ValueError(
+                "span already finished for service=%r span=%r" % (service, span)
+            )
         record["end"] = self.clock()
         record["error"] = error
+        return None
 
     @staticmethod
     def _span_entry(service, span, record):
