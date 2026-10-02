@@ -16,4 +16,5 @@ Tests: python3 -m unittest discover -s tests -v
 - `start(span, parent=None, service=None)` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。
 - `query(status)`：仅接受 `'open'`（`end` 为空）和 `'error'`（已结束且 `error` 非空），其他值抛 `ValueError`，无匹配返回 `[]`；结果含 `span/service/parent/start/end/error`，按服务、开始时间、标识排序。
 - `snapshot()` / `json()`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。
+- `Telemetry.from_snapshot(payload, clock=time.time)`：离线把 `snapshot()` 字典或 `json()` 文本重建为独立实例，计数器、样本原值与跨度的 parent/start/end/error 全部带回，样本统计按公开浮点规则从 values 重算（输入中存在的统计字段须与重算一致，空 values 不得携带统计）。payload 顶层只能含 `counters`、`samples`、`spans` 三个数组；缺字段、多字段、非法 JSON、重复记录、无效标签、不可哈希跨度标识、不可严格 JSON 表示的值等一律抛 `ValueError`，且失败前不留下半成品实例、不改动已有实例。恢复过程不联网、不读写文件、不修改输入；恢复后与原对象互不共享数据，`open` 跨度可继续用 `finish()` 结束。
 
