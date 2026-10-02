@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import unittest
@@ -302,6 +303,170 @@ class TelemetryRestoreTest(unittest.TestCase):
                     Telemetry.from_snapshot(payload)
         # 失败恢复不影响已有实例
         self.assertEqual(t.snapshot(), self.build().snapshot())
+
+
+class TelemetryMergeTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.inc("hits", 2, labels=(("a", 1),))
+        t.inc("only", 5, service="api")
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.start("r1")
+        t.finish("r1", error="boom")
+        t.start("open1", service="api", parent="p")
+        return t
+
+    def shard(self):
+        p = Telemetry(iter(range(2000)).__next__)
+        p.inc("hits", 3, labels=(("a", 1),))
+        p.inc("newhits", 7)
+        p.observe("lat", "3.5", service="api")
+        p.observe("lat", 4, service="web")
+        p.samples[("", "empty", ())] = []
+        p.start("open2", service="api", parent=("x",))
+        p.start("r1")
+        p.finish("r1", error="boom")
+        p.start("onlyspan", service="web")
+        p.finish("onlyspan", service="web", error={"code": 1})
+        snap = p.snapshot()
+        # r1 与当前实例完全一致（start 0/end 1/error boom）
+        for record in snap["spans"]:
+            if record["span"] == "r1":
+                record["start"] = 0
+                record["end"] = 1
+        return snap
+
+    def test_accepts_dict_text_and_bytes(self):
+        text = json.dumps(self.shard(), sort_keys=True, separators=(",", ":"))
+        for raw in (self.shard(), text, text.encode("utf-8")):
+            t = self.build()
+            self.assertIsNone(t.merge_snapshot(raw))
+            counters = {
+                (c["service"], c["name"], tuple(c["labels"])): c["value"]
+                for c in t.snapshot()["counters"]
+            }
+            self.assertEqual(counters[("", "hits", (("a", 1),))], 5)
+            self.assertEqual(counters[("api", "only", ())], 5)
+            self.assertEqual(counters[("", "newhits", ())], 7)
+
+    def test_samples_concatenated_and_stats_recomputed(self):
+        t = self.build()
+        t.merge_snapshot(self.shard())
+        samples = {(s["service"], s["name"]): s for s in t.snapshot()["samples"]}
+        self.assertEqual(samples[("api", "lat")]["values"], [1, 2.5, "3.5"])
+        self.assertEqual(samples[("api", "lat")]["count"], 3)
+        self.assertEqual(samples[("api", "lat")]["sum"], 7.0)
+        self.assertEqual(samples[("api", "lat")]["mean"], 7.0 / 3)
+        self.assertEqual(samples[("web", "lat")]["values"], [4])
+        self.assertEqual(
+            set(samples[("", "empty")]),
+            {"service", "name", "labels", "values"},
+        )
+
+    def test_spans_query_finish_and_parent(self):
+        t = self.build()
+        t.merge_snapshot(self.shard())
+        self.assertEqual(
+            {(e["service"], e["span"]) for e in t.query("open")},
+            {("api", "open1"), ("api", "open2")},
+        )
+        self.assertEqual(
+            {(e["service"], e["span"]) for e in t.query("error")},
+            {("", "r1"), ("web", "onlyspan")},
+        )
+        t.clock = lambda: 999.0
+        t.finish("open2", service="api", error="late")
+        entry = [e for e in t.query("error") if e["span"] == "open2"][0]
+        self.assertEqual(entry["end"], 999.0)
+        self.assertEqual(entry["parent"], ("x",))
+
+    def test_identical_span_is_idempotent_conflict_rolls_back(self):
+        t = self.build()
+        before = t.snapshot()
+        spans_only = {"counters": [], "samples": [], "spans": before["spans"]}
+        t.merge_snapshot(spans_only)
+        self.assertEqual(t.snapshot(), before)
+
+        conflict = self.shard()
+        for record in conflict["spans"]:
+            if record["span"] == "r1":
+                record["error"] = "different"
+        with self.assertRaises(ValueError):
+            t.merge_snapshot(conflict)
+        self.assertEqual(t.snapshot(), before)  # 计数器累加等变化一并撤销
+
+    def test_label_normalization_keys_merge(self):
+        a = Telemetry()
+        a.inc("m", 1, labels=(("a", 1), ("b", 2)))
+        b = Telemetry()
+        b.inc("m", 4, labels=(("b", 2), ("a", 1)))
+        a.merge_snapshot(b.snapshot())
+        snap = a.snapshot()["counters"]
+        self.assertEqual(len(snap), 1)
+        self.assertEqual(snap[0]["labels"], [("a", 1), ("b", 2)])
+        self.assertEqual(snap[0]["value"], 5)
+
+    def test_counter_add_failure_rolls_back(self):
+        t = Telemetry.from_snapshot({
+            "counters": [
+                {"service": "", "name": "c", "labels": [], "value": "ab"},
+            ],
+            "samples": [],
+            "spans": [],
+        })
+        before = t.snapshot()
+        with self.assertRaises(ValueError):
+            t.merge_snapshot({
+                "counters": [
+                    {"service": "", "name": "c", "labels": [], "value": 1},
+                ],
+                "samples": [],
+                "spans": [],
+            })
+        self.assertEqual(t.snapshot(), before)
+
+    def test_input_not_mutated_and_not_shared(self):
+        t = self.build()
+        payload = self.shard()
+        payload_copy = copy.deepcopy(payload)
+        t.merge_snapshot(payload)
+        self.assertEqual(payload, payload_copy)  # 输入未被改写
+        # 改动 payload 内部对象不影响已合并的实例
+        payload["counters"][0]["value"] = 999
+        payload["samples"][0]["values"].append(999)
+        payload["spans"][0]["parent"] = "changed"
+        again = self.build()
+        again.merge_snapshot(payload_copy)
+        self.assertEqual(t.snapshot(), again.snapshot())
+
+    def test_invalid_payloads_leave_instance_untouched(self):
+        t = self.build()
+        before = t.snapshot()
+        good_span = {"span": "s", "service": "", "parent": None,
+                     "start": 0, "end": None, "error": None}
+        cases = [
+            b"\xff not utf-8",
+            "{not json",
+            {"counters": [], "samples": []},
+            {"counters": [], "samples": [], "spans": [], "extra": 1},
+            {"counters": [
+                {"service": "", "name": "c", "labels": [], "value": 1},
+                {"service": "", "name": "c", "labels": [], "value": 2},
+            ], "samples": [], "spans": []},
+            {"counters": [], "samples": [], "spans": [dict(good_span), dict(good_span)]},
+            {"counters": [],
+             "samples": [{"service": "", "name": "m", "labels": [],
+                          "values": [float("nan")]}],
+             "spans": []},
+            {"counters": [{"service": "", "name": "c",
+                           "labels": [["k", float("nan")]], "value": 1}],
+             "samples": [], "spans": []},
+        ]
+        for index, payload in enumerate(cases):
+            with self.assertRaises(ValueError, msg="case %d" % index):
+                t.merge_snapshot(payload)
+            self.assertEqual(t.snapshot(), before, msg="case %d" % index)
 
 
 if __name__ == "__main__":

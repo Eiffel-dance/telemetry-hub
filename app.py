@@ -243,6 +243,66 @@ class Telemetry:
         instance.spans = spans
         return instance
 
+    # ------------------------------------------------------------------
+    # 离线分片合并
+    # ------------------------------------------------------------------
+
+    def merge_snapshot(self, payload):
+        """把另一份离线分片快照原子合并进当前实例，成功返回 None。
+
+        输入接受范围与 from_snapshot 一致（快照字典、JSON 文本、UTF-8 字节）。
+        先完整解析并校验，再在临时结构上试合并，最后一次性提交：任何字段
+        缺失/多余、重复记录、非严格 JSON、无效标签、不可用标识、非有限样本、
+        计数器不可相加或同键跨度不一致都抛 ValueError，当前实例的全部聚合、
+        跨度与时钟配置保持不变，输入对象也不被改写；解析阶段已切断与
+        payload 的引用，合并后的数据不与 payload 或其中的列表、标签共享
+        可变对象。
+        """
+        data = self._restore_parse(payload)
+        counters, samples, spans = self._restore_validate(data)
+
+        # 以下全部在副本上试合并，结束前绝不写回 self。
+        merged_counters = dict(self.counters)
+        for key, value in counters.items():
+            if key in merged_counters:
+                try:  # 与 inc 相同的加法语义：当前值在前、输入值在后
+                    value = merged_counters[key] + value
+                except Exception as exc:
+                    raise ValueError(
+                        "counter values cannot be added: %s" % (exc,)
+                    )
+            merged_counters[key] = value
+
+        merged_samples = dict(self.samples)
+        for key, values in samples.items():
+            if key in merged_samples:
+                # 新建列表：先保留当前 values，再按输入顺序追加，
+                # 原值类型与写入顺序不变；统计在 snapshot 时统一重算。
+                values = merged_samples[key] + values
+            merged_samples[key] = values
+
+        merged_spans = dict(self.spans)
+        for key, record in spans.items():
+            if key in merged_spans:
+                try:  # 两方记录完全一致才幂等，不猜测生命周期如何更新
+                    conflict = merged_spans[key] != record
+                except Exception as exc:
+                    raise ValueError(
+                        "span records cannot be compared: %s" % (exc,)
+                    )
+                if conflict:
+                    raise ValueError(
+                        "conflicting span record for service=%r span=%r"
+                        % (key[0], key[1])
+                    )
+            else:
+                merged_spans[key] = record
+
+        self.counters = merged_counters
+        self.samples = merged_samples
+        self.spans = merged_spans
+        return None
+
     @staticmethod
     def _restore_pairs_hook(pairs):
         # object_pairs_hook：JSON 文本层面的重复键一律拒绝。
