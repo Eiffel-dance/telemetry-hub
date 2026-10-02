@@ -469,5 +469,138 @@ class TelemetryMergeTest(unittest.TestCase):
             self.assertEqual(t.snapshot(), before, msg="case %d" % index)
 
 
+class TelemetryTraceTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("a")
+        t.start("a1", parent="a")
+        t.start("a2", parent="a")
+        t.start("a1x", parent="a1")
+        t.start("a", service="api")  # 同标识、不同服务，默认服务树不得包含
+        t.start("orphan", parent="missing", service="api")
+        t.finish("a")
+        t.finish("a1")
+        t.finish("a2")
+        t.finish("a1x")
+        t.finish("a", service="api", error="boom")
+        return t
+
+    def test_root_resolution_fields_and_order(self):
+        t = self.build()
+        # 从任意后代出发都定位到同一根
+        for start in ("a", "a1", "a2", "a1x"):
+            tree = t.trace(start)
+            self.assertEqual(tree["span"], "a")
+            self.assertEqual(tree["service"], "")
+            self.assertIsNone(tree["parent"])
+            self.assertEqual(tree["start"], 0)
+        tree = t.trace("a1x")
+        self.assertEqual(set(tree), {"span", "service", "parent", "start", "end", "error", "children"})
+        self.assertEqual([n["span"] for n in tree["children"]], ["a1", "a2"])
+        self.assertEqual([n["span"] for n in tree["children"][0]["children"]], ["a1x"])
+        self.assertEqual(tree["children"][0]["children"][0]["children"], [])
+        self.assertEqual(tree["children"][1]["children"], [])
+        # 叶子字段完整，parent 原样保留
+        leaf = tree["children"][0]["children"][0]
+        self.assertEqual(leaf["parent"], "a1")
+        self.assertIsNone(leaf["error"])
+
+    def test_children_ordered_by_service_start_span(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("late", parent="r")
+        t.start("early", parent="r")
+        t.start("r")
+        tree = t.trace("late")
+        self.assertEqual(tree["span"], "r")
+        self.assertEqual([n["span"] for n in tree["children"]], ["late", "early"])
+
+    def test_missing_span_returns_none(self):
+        t = self.build()
+        self.assertIsNone(t.trace("nope"))
+        self.assertIsNone(t.trace("a1", service="api"))  # 仅默认服务有 a1
+        # 显式服务定位到另一个独立跨度，无子节点
+        api = t.trace("a", service="api")
+        self.assertEqual(api["span"], "a")
+        self.assertEqual(api["service"], "api")
+        self.assertEqual(api["children"], [])
+        self.assertEqual(api["error"], "boom")
+
+    def test_invalid_arguments_raise_valueerror(self):
+        t = self.build()
+        for bad in ("", 1, b"x", 1.5):
+            with self.assertRaises(ValueError):
+                t.trace("a", service=bad)
+        for bad in (["x"], {}, {"x"}):
+            with self.assertRaises(ValueError):
+                t.trace(bad)
+        # 非法参数不得改变数据
+        self.assertEqual(t.snapshot(), self.build().snapshot())
+
+    def test_cross_service_parent_and_child_ignored(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("x", service="api", parent="a")  # a 只在默认服务
+        t.start("a")
+        node = t.trace("x", service="api")
+        self.assertEqual(node["span"], "x")
+        self.assertEqual(node["children"], [])
+        root = t.trace("a")
+        self.assertEqual(root["span"], "a")
+        self.assertEqual(root["children"], [])  # api 的 x 不算 a 的子节点
+
+    def test_cycle_raises_valueerror(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.spans[("", "p")] = {"parent": "q", "start": 0, "end": None, "error": None}
+        t.spans[("", "q")] = {"parent": "p", "start": 1, "end": None, "error": None}
+        for start in ("p", "q"):
+            with self.assertRaises(ValueError):
+                t.trace(start)
+        # 自环
+        t.spans[("", "s")] = {"parent": "s", "start": 2, "end": None, "error": None}
+        with self.assertRaises(ValueError):
+            t.trace("s")
+        # 沿 parent 向上走进环也必须报错
+        t.spans[("", "z")] = {"parent": "p", "start": 3, "end": None, "error": None}
+        with self.assertRaises(ValueError):
+            t.trace("z")
+        # 环外的无关节点仍可正常查询
+        self.assertIsNone(t.trace("p", service="other"))
+        t.spans[("other", "p")] = {"parent": None, "start": 4, "end": None, "error": None}
+        self.assertEqual(t.trace("p", service="other")["span"], "p")
+        # 抛错不留下数据变化
+        self.assertEqual(t.snapshot(), t.snapshot())
+
+    def test_returned_tree_is_independent(self):
+        t = self.build()
+        before = copy.deepcopy(t.snapshot())
+        tree = t.trace("a")
+        tree["span"] = "HACK"
+        tree["children"].append("HACK")
+        tree["children"][0]["span"] = "HACK"
+        tree["children"][0]["children"][0]["error"] = RuntimeError("x")
+        self.assertEqual(t.snapshot(), before)
+        again = t.trace("a")
+        self.assertEqual(again["span"], "a")
+        self.assertEqual(again["children"][0]["span"], "a1")
+        again["children"].clear()
+        self.assertEqual([n["span"] for n in t.trace("a")["children"]], ["a1", "a2"])
+
+    def test_hashable_non_string_identifiers(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start(("r",), service="api")
+        t.start(("c", 1), parent=("r",), service="api")
+        t.start(("c", "1"), parent=("r",), service="api")  # 1 != "1"
+        tree = t.trace(("c", 1), service="api")
+        self.assertEqual(tree["span"], ("r",))
+        self.assertEqual([n["span"] for n in tree["children"]], [("c", 1), ("c", "1")])
+
+    def test_trace_after_restore(self):
+        t = self.build()
+        restored = Telemetry.from_snapshot(t.json())
+        tree = restored.trace("a1x")
+        self.assertEqual(tree["span"], "a")
+        self.assertEqual([n["span"] for n in tree["children"]], ["a1", "a2"])
+        self.assertIsNone(restored.trace("missing"))
+
+
 if __name__ == "__main__":
     unittest.main()

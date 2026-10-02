@@ -131,6 +131,92 @@ class Telemetry:
                 result.append(entry)
         return result
 
+    def trace(self, span, service=None):
+        """从给定跨度出发还原同一服务内的父子跨度树，全程只读。
+
+        service 按既有规则归一化（None 为默认服务，显式值必须是非空字符串），
+        span 必须可哈希，否则抛 ValueError。先沿 parent 在同一服务内向上定位
+        唯一根跨度：父标识指向其他服务或不存在的跨度时，当前节点即视为根。
+        起始跨度不存在时返回 None。根可达的父子引用成环时抛 ValueError，
+        不返回部分树。返回的每个节点为独立字典，含
+        span/service/parent/start/end/error 与 children；children 只包含
+        parent 与当前节点标识精确相等且同服务的直接子跨度，每层按快照的
+        服务、开始时间、标识顺序排序，无子节点为空数组。修改返回对象或其中
+        列表不影响聚合器内部数据。
+        """
+        service = self._service(service)
+        try:
+            hash(span)
+        except TypeError:
+            raise ValueError("span must be hashable")
+        start_key = (service, span)
+        if start_key not in self.spans:
+            return None
+
+        # 沿 parent 向上找同服务根节点；父指向其他服务或缺失即停止。
+        root_key = start_key
+        ancestors = {start_key}
+        while True:
+            parent = self.spans[root_key]["parent"]
+            parent_key = (service, parent)
+            try:  # 不可哈希的父标识不可能命中任何键，按父缺失处理
+                parent_present = parent_key in self.spans
+            except TypeError:
+                parent_present = False
+            if not parent_present:
+                break
+            if parent_key in ancestors:  # 祖先链自身成环，无根可定位
+                raise ValueError("cycle detected in span trace")
+            ancestors.add(parent_key)
+            root_key = parent_key
+
+        # 自根向下迭代展开，所有节点/列表均为新建，绝不回写 self.spans。
+        root_node = None
+        visited = set()
+        stack = [(root_key, None)]
+        while stack:
+            key, parent_node = stack.pop()
+            if key in visited:  # 根可达引用成环（含自指父）
+                raise ValueError("cycle detected in span trace")
+            visited.add(key)
+            node_service, node_span = key
+            record = self.spans[key]
+            node = {
+                "span": node_span,
+                "service": node_service,
+                "parent": record["parent"],
+                "start": record["start"],
+                "end": record["end"],
+                "error": record["error"],
+                "children": [],
+            }
+            if parent_node is None:
+                root_node = node
+            else:
+                parent_node["children"].append(node)
+
+            child_keys = []
+            for child_key, child_record in self.spans.items():
+                if child_key[0] != node_service:
+                    continue
+                try:  # 父引用与标识的精确相等；比较抛异常时按不相等处理
+                    is_child = child_record["parent"] == node_span
+                except Exception:
+                    is_child = False
+                if is_child:
+                    child_keys.append(child_key)
+            child_keys.sort(
+                key=lambda candidate: (
+                    _Orderable(candidate[0]),
+                    _Orderable(self.spans[candidate]["start"]),
+                    _Orderable(candidate[1]),
+                )
+            )
+            # 逆序压栈、正序弹出，保证 children 最终为快照排序顺序。
+            for child_key in reversed(child_keys):
+                stack.append((child_key, node))
+        return root_node
+
     @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
