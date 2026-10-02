@@ -243,6 +243,53 @@ class Telemetry:
         instance.spans = spans
         return instance
 
+    def merge_snapshot(self, payload):
+        """把一份离线快照原子地合并进当前实例，成功返回 None。
+
+        输入接受范围与 from_snapshot 一致（字典、JSON 文本、UTF-8 字节）。
+        先完整解析并校验，再在临时结构上演练全部合并；计数器不可相加或
+        跨度记录冲突时同样抛 ValueError。只有全部成功后才一次性替换当前
+        实例的聚合与跨度，因此任何失败都不会改动时钟配置与已有数据，
+        也不会改写输入对象；恢复侧数据经深拷贝/JSON 解析，与 payload
+        的列表、标签等可变对象互不共享。
+        """
+        data = self._restore_parse(payload)
+        counters, samples, spans = self._restore_validate(data)
+
+        merged_counters = dict(self.counters)
+        for key, value in counters.items():
+            if key in merged_counters:
+                # 沿用 inc 的加法语义；无法相加视为恢复错误。
+                try:
+                    value = merged_counters[key] + value
+                except TypeError as exc:
+                    raise ValueError(
+                        "counter values cannot be added: %s" % (exc,)
+                    )
+            merged_counters[key] = value
+
+        merged_samples = dict(self.samples)
+        for key, values in samples.items():
+            if key in merged_samples:
+                # 先保留当前 values（原值类型、写入顺序），再按输入顺序
+                # 追加；统计在 snapshot 时按公开浮点规则从完整 values 重算。
+                values = list(merged_samples[key]) + list(values)
+            merged_samples[key] = values
+
+        merged_spans = dict(self.spans)
+        for key, record in spans.items():
+            if key in merged_spans:
+                # 完全一致才幂等；生命周期不一致不猜测，整次合并作废。
+                if merged_spans[key] != record:
+                    raise ValueError("conflicting span record: %r" % (key,))
+            else:
+                merged_spans[key] = record
+
+        self.counters = merged_counters
+        self.samples = merged_samples
+        self.spans = merged_spans
+        return None
+
     @staticmethod
     def _restore_pairs_hook(pairs):
         # object_pairs_hook：JSON 文本层面的重复键一律拒绝。

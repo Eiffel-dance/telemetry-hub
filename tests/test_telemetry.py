@@ -304,5 +304,215 @@ class TelemetryRestoreTest(unittest.TestCase):
         self.assertEqual(t.snapshot(), self.build().snapshot())
 
 
+class TelemetryMergeTest(unittest.TestCase):
+    def build_pair(self):
+        a = Telemetry(iter(range(100)).__next__)
+        a.inc("hits", 2)
+        a.inc("only_a", 5)
+        a.observe("lat", 1, service="api")
+        a.observe("lat", 2.5, service="api")
+        a.start("s1")
+        a.finish("s1", error="boom")
+        a.start("open_a")
+
+        b = Telemetry(iter(range(200, 400)).__next__)
+        b.inc("hits", 4)                            # 与 a 同键 -> 累加
+        b.inc("hits", 3, service="api")             # 新记录
+        b.observe("lat", "3.5", service="api")      # 追加到同一样本
+        b.observe("lat", 9, service="web")
+        b.spans[("", "s1")] = {                     # 与 a 完全一致 -> 幂等
+            "parent": None, "start": 0, "end": 1, "error": "boom",
+        }
+        b.start("open_b", service="api", parent="p")
+        return a, b
+
+    def test_merge_basic_accumulation(self):
+        a, b = self.build_pair()
+        self.assertIsNone(a.merge_snapshot(b.snapshot()))
+        snap = a.snapshot()
+        counters = {(c["service"], c["name"]): c["value"]
+                    for c in snap["counters"]}
+        self.assertEqual(counters, {
+            ("", "hits"): 6, ("", "only_a"): 5, ("api", "hits"): 3,
+        })
+        lat = {s["service"]: s for s in snap["samples"] if s["name"] == "lat"}
+        self.assertEqual(lat["api"]["values"], [1, 2.5, "3.5"])
+        self.assertEqual(lat["api"]["count"], 3)
+        self.assertEqual(lat["api"]["sum"], 7.0)
+        self.assertEqual(lat["api"]["minimum"], 1.0)
+        self.assertEqual(lat["api"]["maximum"], 3.5)
+        self.assertEqual(lat["api"]["mean"], 7.0 / 3)
+        self.assertEqual(lat["web"]["values"], [9])
+
+    def test_merge_accepts_text_and_bytes(self):
+        _, b = self.build_pair()
+        for payload in (b.json(), b.json().encode("utf-8")):
+            t = Telemetry()
+            self.assertIsNone(t.merge_snapshot(payload))
+            self.assertEqual(t.snapshot(), b.snapshot())
+
+    def test_merge_label_normalization_keys(self):
+        a = Telemetry()
+        a.inc("k", 1, labels=(("a", 1), ("b", 2)))
+        b = Telemetry()
+        b.inc("k", 1, labels=(("b", 2), ("a", 1)))  # 归一化后同键
+        a.merge_snapshot(b.snapshot())
+        counters = a.snapshot()["counters"]
+        self.assertEqual(len(counters), 1)
+        self.assertEqual(counters[0]["labels"], [("a", 1), ("b", 2)])
+        self.assertEqual(counters[0]["value"], 2)
+
+    def test_merge_spans_query_and_finish(self):
+        a, b = self.build_pair()
+        a.merge_snapshot(b.snapshot())
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in a.query("open")],
+            [("", "open_a"), ("api", "open_b")],
+        )
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in a.query("error")],
+            [("", "s1")],
+        )
+        # 来自输入的未结束跨度可按服务结束，父标识原值保留
+        a.finish("open_b", service="api", error="late")
+        self.assertEqual(
+            [e["span"] for e in a.query("open")], ["open_a"]
+        )
+        record = a.spans[("api", "open_b")]
+        self.assertEqual(record["parent"], "p")
+        self.assertEqual(record["error"], "late")
+
+    def test_merge_does_not_mutate_or_share_input(self):
+        import copy
+        payload = {
+            "counters": [{"service": "", "name": "c",
+                          "labels": [["k", "v"]], "value": 1}],
+            "samples": [{"service": "", "name": "s",
+                         "labels": [["k", "v"]], "values": [1]}],
+            "spans": [{"span": "z", "service": "", "parent": {"trace": 1},
+                       "start": 0, "end": None, "error": None}],
+        }
+        original = copy.deepcopy(payload)
+        a = Telemetry()
+        a.merge_snapshot(payload)
+        self.assertEqual(payload, original)  # 输入未被改写
+        # 改写 payload 的所有嵌套可变对象不影响合并结果
+        payload["counters"][0]["value"] = 999
+        payload["counters"][0]["labels"][0][1] = "changed"
+        payload["samples"][0]["values"].append(1234)
+        payload["spans"][0]["parent"]["trace"] = 99
+        merged = a.snapshot()
+        self.assertEqual(merged["counters"][0]["value"], 1)
+        self.assertEqual(merged["counters"][0]["labels"], [("k", "v")])
+        self.assertEqual(merged["samples"][0]["values"], [1])
+        self.assertEqual(merged["spans"][0]["parent"], {"trace": 1})
+
+    def test_merge_invalid_payload_rolls_back(self):
+        a, _ = self.build_pair()
+        import copy
+        before = copy.deepcopy(a.snapshot())
+        bad_payloads = [
+            "{not json}",
+            b"\xff",
+            {"counters": [], "samples": []},                       # 缺 spans
+            {"counters": [], "samples": [], "spans": [], "x": 1},  # 多余字段
+            {"counters": "no", "samples": [], "spans": []},
+            {"counters": [{"service": "", "name": "x",
+                           "labels": [["k", 1], ["k", 2]], "value": 1}],
+             "samples": [], "spans": []},                          # 无效标签
+            {"counters": [], "samples": [{"service": "", "name": "m",
+                                          "labels": [], "values": [float("nan")]}],
+             "spans": []},                                         # 非有限样本
+            {"counters": [], "samples": [], "spans": [
+                {"span": ["unhashable"], "service": "", "parent": None,
+                 "start": 0, "end": None, "error": None}]},        # 不可哈希标识
+            '{"counters":[],"samples":[],"spans":[],"x":NaN}',     # 非严格 JSON
+        ]
+        for bad in bad_payloads:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                a.merge_snapshot(bad)
+            self.assertEqual(a.snapshot(), before)
+        # 时钟配置不变
+        self.assertEqual(a.clock.__name__ if hasattr(a.clock, "__name__") else None,
+                         "__next__")
+
+    def test_merge_counter_add_failure_rolls_back(self):
+        a, b = Telemetry(), Telemetry()
+        a.counters[("", "x", ())] = "str"
+        b.inc("x", 1)
+        import copy
+        before = copy.deepcopy(a.snapshot())
+        with self.assertRaises(ValueError):
+            a.merge_snapshot(b.snapshot())
+        self.assertEqual(a.snapshot(), before)
+
+    def test_merge_conflicting_span_rolls_back_all(self):
+        a = Telemetry(iter(range(10)).__next__)
+        a.inc("h", 1)
+        a.observe("m", 1)
+        a.start("s")
+        a.finish("s")
+        b = Telemetry(iter(range(10)).__next__)
+        b.inc("h", 2)          # 本可累加
+        b.observe("m", 2)      # 本可追加
+        b.start("s")           # 同为 open/closed 冲突（a 已结束，b 未结束）
+        import copy
+        before = copy.deepcopy(a.snapshot())
+        with self.assertRaises(ValueError):
+            a.merge_snapshot(b.snapshot())
+        self.assertEqual(a.snapshot(), before)  # 全部撤销
+        self.assertEqual(a.query("error"), [])
+
+    def test_merge_identical_span_is_idempotent(self):
+        a, b = self.build_pair()
+        a.merge_snapshot(b.snapshot())
+        spans = a.snapshot()["spans"]
+        self.assertEqual(
+            [e["span"] for e in spans if e["span"] == "s1"].count("s1"), 1
+        )
+        # 再次合并同样的跨度仍成功
+        a.merge_snapshot(b.snapshot())
+        self.assertEqual(
+            len([e for e in a.snapshot()["spans"] if e["span"] == "s1"]), 1
+        )
+
+    def test_merge_empty_sample_keeps_no_stats(self):
+        t = Telemetry()
+        t.samples[("", "e", ())] = []
+        t.merge_snapshot({"counters": [], "samples": [], "spans": []})
+        entry = t.snapshot()["samples"][0]
+        self.assertEqual(set(entry), {"service", "name", "labels", "values"})
+
+    def test_merge_stable_json_and_no_shared_span_objects(self):
+        a, b = self.build_pair()
+        a.merge_snapshot(b.snapshot())
+        self.assertEqual(
+            a.json(),
+            json.dumps(a.snapshot(), sort_keys=True, separators=(",", ":")),
+        )
+        # 入站跨度的嵌套对象不共享
+        payload = {"counters": [], "samples": [], "spans": [
+            {"span": "w", "service": "", "parent": {"trace": 1},
+             "start": 1, "end": None, "error": None}]}
+        t = Telemetry()
+        t.merge_snapshot(payload)
+        payload["spans"][0]["parent"]["trace"] = 99
+        self.assertEqual(t.spans[("", "w")]["parent"], {"trace": 1})
+
+    def test_merge_preserves_non_strict_error_placeholder(self):
+        src = Telemetry(iter(range(3)).__next__)
+        src.start("q")
+        src.finish("q", error=ValueError("x"))
+        t = Telemetry()
+        with self.assertRaises(ValueError):  # dict 形式携带不可表示异常
+            t.merge_snapshot(src.snapshot())
+        self.assertEqual(t.spans, {})
+        t.merge_snapshot(src.json())        # JSON 形式已是占位对象
+        self.assertEqual(
+            t.query("error")[0]["error"],
+            {"type": "ValueError", "message": "x"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
