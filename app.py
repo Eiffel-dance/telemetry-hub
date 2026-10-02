@@ -179,5 +179,29 @@ class Telemetry:
             "spans": self._span_entries(),
         }
 
+    @staticmethod
+    def _json_safe_error(error):
+        # 能被标准 JSON 严格表示的原样保留；否则整体替换为
+        # {"type": 运行时类名, "message": str(error)}。取值过程中的任何
+        # 异常都不得泄漏给调用方，失败的部分回退为空字符串。
+        try:
+            json.dumps(error, allow_nan=False)
+        except Exception:
+            try:
+                type_name = type(error).__name__
+            except Exception:
+                type_name = ""
+            try:
+                message = str(error)
+            except Exception:
+                message = ""
+            return {"type": type_name, "message": message}
+        return error
+
     def json(self):
-        return json.dumps(self.snapshot(), sort_keys=True, separators=(",", ":"))
+        snapshot = self.snapshot()
+        # 只转换本次序列化用的快照副本：span 条目由 snapshot() 新建，
+        # 改写其中的 error 不会回写 self.spans，也不影响 query 结果。
+        for entry in snapshot["spans"]:
+            entry["error"] = self._json_safe_error(entry["error"])
+        return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
