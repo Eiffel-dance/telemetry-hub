@@ -469,5 +469,95 @@ class TelemetryMergeTest(unittest.TestCase):
             self.assertEqual(t.snapshot(), before, msg="case %d" % index)
 
 
+class TelemetryTraceTest(unittest.TestCase):
+    def build(self):
+        clock = iter(range(100)).__next__
+        t = Telemetry(clock)
+        t.start("root")                       # 0
+        t.start("b", parent="root")           # 1
+        t.start("a", parent="root")           # 2
+        t.start("a1", parent="a")             # 3
+        t.finish("a1", error="boom")          # 4
+        t.start("root", service="api")        # 5，同名但不同服务
+        t.start("x", service="api", parent="root")  # 6，不属于默认服务的树
+        t.start("orphan", parent="ghost")     # 7，父标识不存在
+        return t
+
+    def test_trace_builds_sorted_tree(self):
+        t = self.build()
+        tree = t.trace("root")
+        self.assertEqual(
+            set(tree),
+            {"span", "service", "parent", "start", "end", "error", "children"},
+        )
+        self.assertEqual(tree["span"], "root")
+        self.assertEqual(tree["service"], "")
+        self.assertIsNone(tree["parent"])
+        # children 按服务、开始时间、标识排序：b(1) 在 a(2) 前
+        self.assertEqual([c["span"] for c in tree["children"]], ["b", "a"])
+        self.assertEqual(tree["children"][0]["children"], [])
+        a = tree["children"][1]
+        self.assertEqual([c["span"] for c in a["children"]], ["a1"])
+        self.assertEqual(a["children"][0]["error"], "boom")
+        self.assertIsNotNone(a["children"][0]["end"])
+        self.assertEqual(a["children"][0]["children"], [])
+
+    def test_trace_service_isolation(self):
+        t = self.build()
+        tree = t.trace("root", service="api")
+        self.assertEqual(tree["service"], "api")
+        # 只含同服务的直接子跨度；默认服务的 b/a 不出现
+        self.assertEqual([c["span"] for c in tree["children"]], ["x"])
+        # 父标识指向不存在的跨度：orphan 不是任何人的子节点
+        self.assertNotIn("orphan", json.dumps(t.trace("root"), default=str))
+
+    def test_trace_missing_root_returns_none(self):
+        t = self.build()
+        self.assertIsNone(t.trace("nope"))
+        self.assertIsNone(t.trace("root", service="web"))  # 服务不同即不存在
+
+    def test_trace_invalid_arguments(self):
+        t = self.build()
+        for bad in ("", 1, b"x"):
+            with self.assertRaises(ValueError):
+                t.trace("root", service=bad)
+        for bad in (["root"], {"s": 1}):  # 不可哈希的跨度标识
+            with self.assertRaises(ValueError):
+                t.trace(bad)
+
+    def test_trace_cycle_raises_without_partial_tree(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("a", parent="b")
+        t.start("b", parent="a")
+        with self.assertRaises(ValueError):
+            t.trace("a")
+        t2 = Telemetry(iter(range(100)).__next__)
+        t2.start("self", parent="self")  # 自环
+        with self.assertRaises(ValueError):
+            t2.trace("self")
+
+    def test_trace_result_is_independent(self):
+        t = self.build()
+        before = t.snapshot()
+        tree = t.trace("root")
+        tree["children"][0]["span"] = "mutated"
+        tree["children"].clear()
+        tree["span"] = "mutated"
+        self.assertEqual(t.snapshot(), before)  # 聚合器不受影响
+        again = t.trace("root")
+        self.assertEqual([c["span"] for c in again["children"]], ["b", "a"])
+
+    def test_trace_does_not_mutate_and_matches_snapshot_fields(self):
+        t = self.build()
+        before = t.snapshot()
+        tree = t.trace("root")
+        self.assertEqual(t.snapshot(), before)  # 查询本身无副作用
+        entry = [e for e in before["spans"]
+                 if e["service"] == "" and e["span"] == "a1"][0]
+        node = tree["children"][1]["children"][0]
+        for field in ("span", "service", "parent", "start", "end", "error"):
+            self.assertEqual(node[field], entry[field])
+
+
 if __name__ == "__main__":
     unittest.main()

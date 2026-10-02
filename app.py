@@ -131,6 +131,63 @@ class Telemetry:
                 result.append(entry)
         return result
 
+    def trace(self, span, service=None):
+        """离线诊断：从指定跨度还原同一服务内的父子树。
+
+        service 归一化规则与 start/finish 一致（缺省为默认服务，显式传入
+        必须是非空字符串），跨度标识不可哈希时抛 ValueError。根跨度不存在
+        返回 None；存在时返回独立树对象，节点含 span/service/parent/start/
+        end/error 与 children 数组，children 递归包含 parent 与当前节点标识
+        精确相等且 service 相同的直接子跨度，每层按快照的服务、开始时间、
+        标识顺序排序，无子节点为空数组。父标识指向其他服务或不存在的跨度
+        按无子节点处理；从根可达的父子引用构成环时抛 ValueError，不返回
+        部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
+        """
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        record = self.spans.get((service, span))
+        if record is None:
+            return None
+
+        # 预索引同一服务内 parent -> 子跨度标识，避免每层全表扫描；
+        # 其他服务的跨度即使父标识相同也不属于本树。
+        children_by_parent = {}
+        for (child_service, child_span), child_record in self.spans.items():
+            if child_service != service:
+                continue
+            parent = child_record["parent"]
+            try:  # 不可哈希的父标识无法作为键，也就无法精确等于任何跨度键
+                children_by_parent.setdefault(parent, []).append(child_span)
+            except TypeError:
+                continue
+
+        visited = set()
+
+        def build(node_span, node_record):
+            key = (service, node_span)
+            if key in visited:  # 每个跨度只有一个父标识，重复到达即成环
+                raise ValueError("cycle detected in span parent references")
+            visited.add(key)
+            node = self._span_entry(service, node_span, node_record)
+            node = copy.deepcopy(node)  # 与聚合器切断一切可变对象共享
+            node["children"] = []
+            children = [
+                (child_span, self.spans[(service, child_span)])
+                for child_span in children_by_parent.get(node_span, ())
+            ]
+            children.sort(
+                key=lambda item: (
+                    _Orderable(service),
+                    _Orderable(item[1]["start"]),
+                    _Orderable(item[0]),
+                )
+            )
+            for child_span, child_record in children:
+                node["children"].append(build(child_span, child_record))
+            return node
+
+        return build(span, record)
+
     @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
