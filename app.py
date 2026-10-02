@@ -79,8 +79,20 @@ class Telemetry:
         self.samples.setdefault(key, []).append(value)
 
     def start(self, span, parent=None, service=None):
+        # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
+        # 空字符串，显式传入必须是非空字符串；span 必须可哈希。任一校验
+        # 失败都不推进 clock、不留下半条记录。
         service = self._service(service)
-        self.spans[(service, span)] = {
+        self._restore_hashable(span, "span")
+        key = (service, span)
+        # 跨度由 service 与 span 共同唯一标识：无论同标识跨度仍未结束还是
+        # 已经结束，重复开始一律拒绝，原有 parent/start/end/error 不被覆盖，
+        # clock 也不被推进。
+        if key in self.spans:
+            raise ValueError(
+                "span already exists for service=%r span=%r" % (service, span)
+            )
+        self.spans[key] = {
             "parent": parent,
             "start": self.clock(),
             "end": None,
@@ -88,8 +100,18 @@ class Telemetry:
         }
 
     def finish(self, span, error=None, service=None):
+        # 与 start 相同的入站校验顺序；被拒绝的调用不读取或生成时间戳。
         service = self._service(service)
-        record = self.spans[(service, span)]
+        self._restore_hashable(span, "span")
+        record = self.spans.get((service, span))
+        if record is None:
+            raise ValueError(
+                "span not found for service=%r span=%r" % (service, span)
+            )
+        if record["end"] is not None:  # 已结束跨度不能二次结束
+            raise ValueError(
+                "span already finished for service=%r span=%r" % (service, span)
+            )
         record["end"] = self.clock()
         record["error"] = error
 

@@ -13,7 +13,7 @@ Tests: python3 -m unittest discover -s tests -v
 
 - `inc(name, value=1, labels=(), service=None)` / `observe(name, value, labels=(), service=None)`：可选 `service`，缺省归一化为空字符串（默认服务），显式服务名必须是非空字符串；同名同标签但服务不同分别聚合。标签按键字典序归一化，重复键或不可 JSON 序列化的标签抛 `ValueError`，且不改变已有聚合。
 - 样本保留按写入顺序的原值 `values`；快照对非空样本附 `count`、`sum`（按写入顺序累加）、`minimum`、`maximum`、`mean`（`sum/count`，不四舍五入）。NaN/无穷值抛 `ValueError`，空样本不产生统计。
-- `start(span, parent=None, service=None)` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。
+- `start(span, parent=None, service=None)` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。`start` 写入前先完成 service 与 span 校验（service 缺省归一化为空字符串，显式传入必须是非空字符串；span 必须可哈希），相同 service/span 标识已存在跨度时——无论仍未结束还是已经结束——都抛 `ValueError`，不覆盖原有 parent/start/end/error，也不推进 clock；首次创建成功时以一次 clock 结果作为 `start`，返回 `None`。`finish` 只结束当前存在且 `end` 仍为空的跨度：标识不存在或跨度已结束时抛 `ValueError`，不改变任何聚合数据、不生成新的时间戳；有效调用把 `end` 设为一次 clock 结果、把 `error` 设为传入值并返回 `None`。start/finish 收到不可哈希 span 一律抛 `ValueError`，所有被拒绝的调用都不留下半条记录，也不影响其他服务的数据。
 - `query(status)`：仅接受 `'open'`（`end` 为空）和 `'error'`（已结束且 `error` 非空），其他值抛 `ValueError`，无匹配返回 `[]`；结果含 `span/service/parent/start/end/error`，按服务、开始时间、标识排序。
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
 - `snapshot()` / `json()`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。
