@@ -179,5 +179,43 @@ class Telemetry:
             "spans": self._span_entries(),
         }
 
+    @staticmethod
+    def _is_json_strict(value):
+        # 判定错误值能否被标准 JSON 严格表示：RFC 8259 不接受 NaN/Infinity
+        # 和任意对象。以与最终输出一致的参数试编码；自定义对象在编码过程中
+        # 再次抛出的任何异常都视为不可表示，绝不向 json 调用方泄漏。
+        try:
+            json.dumps(value, sort_keys=True, allow_nan=False)
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _error_placeholder(value):
+        # 不可严格表示时，整个 error 替换为只含 type/message 的对象；
+        # 取类名或 str() 失败则对应字符串退化为空字符串。
+        try:
+            type_name = type(value).__name__
+        except Exception:
+            type_name = ""
+        try:
+            message = str(value)
+        except Exception:
+            message = ""
+        return {"type": type_name, "message": message}
+
     def json(self):
-        return json.dumps(self.snapshot(), sort_keys=True, separators=(",", ":"))
+        snapshot = self.snapshot()
+        # 只改写本次序列化所用的副本：snapshot() 每次新建字典，跨度条目
+        # 需要替换 error 时再复制一份，绝不回写 self.spans / query 结果。
+        safe_spans = []
+        for entry in snapshot["spans"]:
+            error = entry["error"]
+            if self._is_json_strict(error):
+                safe_spans.append(entry)  # 可表示：原样输出，类型与值不变
+            else:
+                safe_entry = dict(entry)
+                safe_entry["error"] = self._error_placeholder(error)
+                safe_spans.append(safe_entry)
+        snapshot["spans"] = safe_spans
+        return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
