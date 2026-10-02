@@ -16,4 +16,5 @@ Tests: python3 -m unittest discover -s tests -v
 - `start(span, parent=None, service=None)` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。
 - `query(status)`：仅接受 `'open'`（`end` 为空）和 `'error'`（已结束且 `error` 非空），其他值抛 `ValueError`，无匹配返回 `[]`；结果含 `span/service/parent/start/end/error`，按服务、开始时间、标识排序。
 - `snapshot()` / `json()`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。
+- `Telemetry.from_snapshot(payload)`：从 `snapshot()` 返回的对象或 `json()` 返回的紧凑 JSON 文本离线重建独立的 `Telemetry` 实例。计数器、样本原始 `values` 和跨度 `parent/start/end/error` 全部带回，样本统计按 `values` 重算（输入若带统计字段必须与重算一致，空 `values` 不得带统计）；恢复后 `snapshot()`/`json()`/`query` 结果与有效输入一致，open 跨度可继续 `finish()`。payload 顶层只能含 `counters`、`samples`、`spans` 三个数组，记录字段不得缺失或多余、键不得重复，服务/标签/名称/跨度标识/时间值必须可严格 JSON 表示（跨度标识还须可哈希）；缺少字段、非法 JSON、重复记录、统计不一致、标签无效等一律抛 `ValueError`，且失败不留半成品实例、不修改输入，成功后输入与新实例互不共享列表和记录。`snapshot()` 对象中不可严格 JSON 表示的 `error`（如异常对象）不能直接恢复，需改用 `json()` 的结果（error 已被替换为 `{"type", "message"}` 占位对象）。
 

@@ -1,6 +1,8 @@
+import copy
 import json
 import math
 import time
+from collections.abc import Mapping
 
 
 class _Orderable:
@@ -219,3 +221,193 @@ class Telemetry:
                 safe_spans.append(safe_entry)
         snapshot["spans"] = safe_spans
         return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+    # ---- 离线快照恢复 ----
+
+    _SAMPLE_STAT_FIELDS = ("count", "sum", "minimum", "maximum", "mean")
+
+    @staticmethod
+    def _require_json_strict(value, what):
+        if not Telemetry._is_json_strict(value):
+            raise ValueError("%s is not strictly JSON-representable" % (what,))
+
+    @staticmethod
+    def _require_hashable(value, what):
+        try:
+            hash(value)
+        except Exception:
+            raise ValueError("%s must be hashable" % (what,))
+
+    @staticmethod
+    def _loads_strict(text):
+        # 与 json() 输出对偶的严格解析：拒绝重复键（标准 loads 会静默覆盖）
+        # 以及 NaN/Infinity 这类非 RFC 8259 常量。
+        def reject_constant(name):
+            raise ValueError("invalid JSON constant: %s" % (name,))
+
+        def object_hook(pairs):
+            seen = set()
+            obj = {}
+            for key, value in pairs:
+                if key in seen:
+                    raise ValueError("duplicate key: %r" % (key,))
+                seen.add(key)
+                obj[key] = value
+            return obj
+
+        try:
+            return json.loads(
+                text, object_pairs_hook=object_hook, parse_constant=reject_constant
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid JSON payload: %s" % (exc,))
+
+    @classmethod
+    def _restore_labels(cls, labels):
+        if not isinstance(labels, (list, tuple)):
+            raise ValueError("labels must be a list of pairs")
+        # 复用写入路径的归一化：重复键或不可 JSON 序列化一律 ValueError。
+        normalized = cls._normalize_labels(labels)
+        cls._require_hashable(normalized, "labels")
+        return normalized
+
+    @classmethod
+    def _metric_key(cls, record, required, optional):
+        if not isinstance(record, Mapping):
+            raise ValueError("record must be a JSON object")
+        keys = set(record)
+        allowed = set(required) | set(optional)
+        if not required <= keys or not keys <= allowed:
+            raise ValueError("record has missing or extra fields")
+        service = record["service"]
+        if not isinstance(service, str):
+            raise ValueError("service must be a string")
+        name = record["name"]
+        cls._require_json_strict(name, "name")
+        cls._require_hashable(name, "name")
+        return service, name, cls._restore_labels(record["labels"])
+
+    @staticmethod
+    def _checked_sample_value(value):
+        # 与 observe 相同的有限数值规则。
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("sample value must be numeric")
+        if math.isnan(numeric) or math.isinf(numeric):
+            raise ValueError("sample value must be finite, got %r" % (value,))
+
+    @classmethod
+    def _restore_counters(cls, records):
+        counters = {}
+        for record in records:
+            service, name, labels = cls._metric_key(
+                record, {"service", "name", "labels", "value"}, ()
+            )
+            value = record["value"]
+            cls._require_json_strict(value, "counter value")
+            key = (service, name, labels)
+            if key in counters:
+                raise ValueError("duplicate counter record")
+            counters[key] = copy.deepcopy(value)
+        return counters
+
+    @classmethod
+    def _restore_samples(cls, records):
+        samples = {}
+        required = {"service", "name", "labels", "values"}
+        for record in records:
+            service, name, labels = cls._metric_key(
+                record, required, cls._SAMPLE_STAT_FIELDS
+            )
+            values = record["values"]
+            if not isinstance(values, list):
+                raise ValueError("sample values must be a list")
+            for value in values:
+                cls._require_json_strict(value, "sample value")
+                cls._checked_sample_value(value)
+            present = [f for f in cls._SAMPLE_STAT_FIELDS if f in record]
+            if present:
+                # 统计字段要么完整出现并与重算一致，要么完全不出现；
+                # 空 values 按公开规则本就不附加统计。
+                if len(present) != len(cls._SAMPLE_STAT_FIELDS) or not values:
+                    raise ValueError("sample stats must be complete and non-empty")
+                expected = cls._sample_stats(values)
+                for field in cls._SAMPLE_STAT_FIELDS:
+                    cls._require_json_strict(record[field], "sample stat")
+                    if record[field] != expected[field]:
+                        raise ValueError("sample stats inconsistent with values")
+            key = (service, name, labels)
+            if key in samples:
+                raise ValueError("duplicate sample record")
+            samples[key] = [copy.deepcopy(value) for value in values]
+        return samples
+
+    @classmethod
+    def _restore_spans(cls, records):
+        spans = {}
+        required = {"span", "service", "parent", "start", "end", "error"}
+        for record in records:
+            if not isinstance(record, Mapping) or set(record) != required:
+                raise ValueError(
+                    "span record must contain exactly %s" % (sorted(required),)
+                )
+            service = record["service"]
+            if not isinstance(service, str):
+                raise ValueError("service must be a string")
+            span = record["span"]
+            cls._require_json_strict(span, "span")
+            cls._require_hashable(span, "span")
+            # end 只能为空或已结束值；其余时间/父子/错误值同样必须可严格 JSON 表示。
+            for field in ("parent", "start", "end", "error"):
+                cls._require_json_strict(record[field], "span %s" % (field,))
+            key = (service, span)
+            if key in spans:
+                raise ValueError("duplicate span record")
+            spans[key] = {
+                "parent": copy.deepcopy(record["parent"]),
+                "start": copy.deepcopy(record["start"]),
+                "end": copy.deepcopy(record["end"]),
+                "error": copy.deepcopy(record["error"]),
+            }
+        return spans
+
+    @classmethod
+    def _validated_state(cls, data):
+        if not isinstance(data, Mapping):
+            raise ValueError("payload must be a snapshot object")
+        try:
+            keys = set(data)
+        except Exception:
+            raise ValueError("payload keys must be hashable")
+        if keys != {"counters", "samples", "spans"}:
+            raise ValueError("payload must contain exactly counters, samples and spans")
+        sections = (data["counters"], data["samples"], data["spans"])
+        if any(not isinstance(section, list) for section in sections):
+            raise ValueError("counters, samples and spans must be arrays")
+        # 全部校验在本地结构上完成后才建实例，失败不会留下半成品。
+        counters = cls._restore_counters(sections[0])
+        samples = cls._restore_samples(sections[1])
+        spans = cls._restore_spans(sections[2])
+        return counters, samples, spans
+
+    @classmethod
+    def from_snapshot(cls, payload):
+        """从 snapshot() 返回的对象或 json() 返回的紧凑 JSON 文本重建独立的
+        Telemetry 实例：计数器、样本原始 values 和跨度 parent/start/end/error
+        全部带回，统计按 values 重算。输入不被修改，新实例与输入不共享列表
+        或记录；任何无法恢复的内容统一抛 ValueError，且不产生半成品实例。"""
+        if isinstance(payload, (str, bytes, bytearray)):
+            data = cls._loads_strict(payload)
+        elif isinstance(payload, Mapping):
+            data = payload
+        else:
+            raise ValueError("payload must be a snapshot object or JSON text")
+        counters, samples, spans = cls._validated_state(data)
+        instance = cls()
+        instance.counters = counters
+        instance.samples = samples
+        instance.spans = spans
+        return instance

@@ -153,5 +153,140 @@ class TelemetryBehaviorTest(unittest.TestCase):
             self.assertNotIn(forbidden, src)
 
 
+class TelemetryFromSnapshotTest(unittest.TestCase):
+    def make_telemetry(self):
+        t = Telemetry(iter(range(100, 200)).__next__)
+        t.inc("hits", 2, labels=(("b", "2"), ("a", "1")))
+        t.inc("hits", service="api")
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.observe("lat", "3.5", service="api")
+        t.start("open-span", parent="p", service="api")
+        t.start("done-span")
+        t.finish("done-span", error="boom")
+        return t
+
+    def test_roundtrip_via_snapshot_object(self):
+        t = self.make_telemetry()
+        snap = t.snapshot()
+        restored = Telemetry.from_snapshot(snap)
+        self.assertEqual(restored.snapshot(), snap)
+        self.assertEqual(restored.json(), t.json())
+        self.assertEqual(restored.query("open"), t.query("open"))
+        self.assertEqual(restored.query("error"), t.query("error"))
+        # open 跨度可在新实例上结束
+        restored.finish("open-span", service="api")
+        self.assertEqual(restored.query("open"), [])
+        self.assertEqual(len(t.query("open")), 1)  # 原实例不受影响
+
+    def test_roundtrip_via_json_text(self):
+        t = self.make_telemetry()
+        restored = Telemetry.from_snapshot(t.json())
+        self.assertEqual(restored.json(), t.json())
+        self.assertEqual(restored.snapshot(), t.snapshot())
+
+    def test_no_sharing_with_input(self):
+        t = self.make_telemetry()
+        snap = t.snapshot()
+        restored = Telemetry.from_snapshot(snap)
+        snap["samples"][0]["values"].append(999)
+        snap["spans"][0]["error"] = "mutated"
+        snap["counters"].append({"service": "", "name": "x", "labels": [], "value": 1})
+        self.assertEqual(restored.snapshot(), t.snapshot())
+        # 反向：新实例继续写入不影响原实例
+        restored.inc("hits")
+        restored.observe("lat", 99, service="api")
+        self.assertNotEqual(restored.snapshot(), t.snapshot())
+        self.assertEqual(
+            [c["value"] for c in t.snapshot()["counters"] if c["service"] == ""],
+            [2],
+        )
+
+    def test_non_strict_error_requires_json_form(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("s")
+        t.finish("s", error=ValueError("x"))
+        with self.assertRaises(ValueError):
+            Telemetry.from_snapshot(t.snapshot())
+        restored = Telemetry.from_snapshot(t.json())
+        self.assertEqual(
+            restored.query("error")[0]["error"],
+            {"type": "ValueError", "message": "x"},
+        )
+
+    def test_empty_values_sample_restored_without_stats(self):
+        payload = {
+            "counters": [],
+            "samples": [
+                {"service": "", "name": "e", "labels": [], "values": []}
+            ],
+            "spans": [],
+        }
+        restored = Telemetry.from_snapshot(payload)
+        entry = restored.snapshot()["samples"][0]
+        self.assertEqual(set(entry), {"service", "name", "labels", "values"})
+
+    def test_invalid_payloads(self):
+        t = self.make_telemetry()
+        good = t.snapshot()
+        bad_payloads = [
+            "not json",
+            42,
+            [],
+            {"counters": [], "samples": []},                              # 缺顶层字段
+            {"counters": [], "samples": [], "spans": [], "extra": []},    # 多顶层字段
+            {"counters": {}, "samples": [], "spans": []},                 # 非数组
+            '{"counters":[],"samples":[],"spans":[],"counters":[]}',      # 重复顶层键
+            '{"counters":[{"service":"","name":"a","labels":[],"value":NaN}],'
+            '"samples":[],"spans":[]}',                                   # 非法常量
+        ]
+        bad_payloads.append({"counters": [{"service": "", "name": "a", "labels": []}],  # 缺 value
+                             "samples": [], "spans": []})
+        bad_payloads.append({"counters": [{"service": "", "name": "a", "labels": [],
+                                           "value": 1, "x": 1}],          # 多字段
+                             "samples": [], "spans": []})
+        dup = dict(good)
+        dup["counters"] = good["counters"][:1] + good["counters"][:1]     # 重复记录
+        bad_payloads.append(dup)
+        mismatch = json.loads(t.json())
+        mismatch["samples"][0]["count"] = 99                              # 统计不一致
+        bad_payloads.append(mismatch)
+        partial = json.loads(t.json())
+        partial["samples"][0] = {"service": "api", "name": "lat", "labels": [],
+                                 "values": [1], "count": 1}               # 统计字段不完整
+        bad_payloads.append(partial)
+        empty_stats = json.loads(t.json())
+        empty_stats["samples"] = [{"service": "", "name": "e", "labels": [],
+                                   "values": [], "count": 0, "sum": 0.0,
+                                   "minimum": 0.0, "maximum": 0.0, "mean": 0.0}]
+        bad_payloads.append(empty_stats)                                  # 空 values 带统计
+        bad_labels = json.loads(t.json())
+        bad_labels["counters"] = [{"service": "", "name": "a", "value": 1,
+                                   "labels": [["k", 1], ["k", 2]]}]       # 标签重复键
+        bad_payloads.append(bad_labels)
+        unhashable_span = json.loads(t.json())
+        unhashable_span["spans"] = [{"span": [1, 2], "service": "", "parent": None,
+                                     "start": 0, "end": None, "error": None}]
+        bad_payloads.append(unhashable_span)                              # 不可哈希跨度标识
+        nan_value = json.loads(t.json())
+        nan_value["samples"][0]["values"] = [float("nan")]                # 非有限样本值
+        bad_payloads.append(nan_value)
+        bad_service = json.loads(t.json())
+        bad_service["counters"][0]["service"] = None                      # 非法服务
+        bad_payloads.append(bad_service)
+        for bad in bad_payloads:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                Telemetry.from_snapshot(bad)
+        # 失败不影响已有实例
+        self.assertEqual(t.snapshot(), good)
+
+    def test_input_not_mutated(self):
+        t = self.make_telemetry()
+        snap = t.snapshot()
+        frozen = json.loads(t.json())
+        Telemetry.from_snapshot(snap)
+        self.assertEqual(json.loads(json.dumps(snap, sort_keys=True)), frozen)
+
+
 if __name__ == "__main__":
     unittest.main()
