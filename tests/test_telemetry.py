@@ -568,5 +568,201 @@ class TelemetryTraceTest(unittest.TestCase):
             self.assertEqual(node[field], entry[field])
 
 
+class TelemetryBatchTest(unittest.TestCase):
+    def _events(self):
+        return [
+            {"op": "inc", "name": "requests", "labels": (("a", 1),)},
+            {"op": "inc", "name": "requests", "value": 2, "service": "api"},
+            {"op": "observe", "name": "lat", "value": 1, "service": "api"},
+            {"op": "observe", "name": "lat", "value": "2.5", "service": "api"},
+            {"op": "start", "span": "root"},
+            {"op": "start", "span": "child", "parent": "root", "service": "api"},
+            {"op": "finish", "span": "root", "error": "boom"},
+            {"op": "finish", "span": "child", "service": "api"},
+        ]
+
+    def _sequential(self, events, clock_factory):
+        t = Telemetry(clock_factory())
+        for event in events:
+            kwargs = {k: v for k, v in event.items() if k != "op"}
+            getattr(t, event["op"])(**kwargs)
+        return t
+
+    def test_matches_sequential_calls(self):
+        events = self._events()
+        seq = self._sequential(copy.deepcopy(events),
+                               lambda: iter(range(1000)).__next__)
+        bat = Telemetry(iter(range(1000)).__next__)
+        self.assertIsNone(bat.batch(copy.deepcopy(events)))
+        self.assertEqual(bat.snapshot(), seq.snapshot())
+        self.assertEqual(bat.json(), seq.json())
+        for status in ("open", "closed", "error"):
+            self.assertEqual(bat.query(status), seq.query(status))
+        self.assertEqual(bat.trace("root"), seq.trace("root"))
+        self.assertEqual(bat.trace("child", service="api"),
+                         seq.trace("child", service="api"))
+
+    def test_tuple_accepted_and_later_spans_usable(self):
+        t = Telemetry(iter(range(100)).__next__)
+        self.assertIsNone(t.batch((
+            {"op": "start", "span": "a"},
+            {"op": "start", "span": "b", "parent": "a"},
+            {"op": "finish", "span": "b"},
+            {"op": "finish", "span": "a"},
+        )))
+        self.assertEqual(t.query("open"), [])
+
+    def test_empty_batch_is_success_and_does_not_read_clock(self):
+        reads = []
+        t = Telemetry(lambda: reads.append(1) or 0.0)
+        t.inc("x")
+        before = t.snapshot()
+        self.assertIsNone(t.batch([]))
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(reads, [])
+
+    def test_clock_read_once_per_start_and_finish_in_order(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.batch([
+            {"op": "start", "span": "a"},
+            {"op": "start", "span": "b"},
+            {"op": "finish", "span": "a"},
+        ])
+        a = t.spans[("", "a")]
+        b = t.spans[("", "b")]
+        self.assertEqual((a["start"], b["start"], a["end"]), (0, 1, 2))
+        self.assertIsNone(b["end"])
+
+    def test_invalid_events_raise_valueerror(self):
+        cases = [
+            None, 42, "nope", {"op": "inc"}, {1: 2},
+            [{"name": "x"}],                            # 缺 op
+            [{"op": "INC", "name": "x"}],               # 未知 op
+            [{"op": ["inc"]}],                          # op 不可哈希
+            [{"op": "inc", "name": "x", "extra": 1}],   # 未知字段
+            [{"op": "observe", "value": 1}],            # 缺 name
+            [{"op": "observe", "name": "m"}],           # observe 缺 value
+            [{"op": "start"}],                          # 缺 span
+            [{"op": "finish"}],                         # 缺 span
+            [{"op": "start", "span": "s", "value": 1}],
+            [{"op": "inc", "name": "x", "parent": None}],
+            ["not-an-object"],
+            [{"op": "inc", "name": "x", "service": ""}],
+            [{"op": "inc", "name": "x",
+              "labels": (("k", 1), ("k", 2))}],
+            [{"op": "observe", "name": "m", "value": float("nan")}],
+            [{"op": "observe", "name": "m", "value": "nope"}],
+            [{"op": "start", "span": ["unhashable"]}],
+            [{"op": "finish", "span": ["unhashable"]}],
+        ]
+        for events in cases:
+            with self.assertRaises(ValueError, msg=repr(events)):
+                Telemetry().batch(events)
+
+    def test_span_lifecycle_violations_rejected(self):
+        existing = Telemetry(iter(range(10)).__next__)
+        existing.start("done")
+        existing.finish("done")
+        cases = [
+            [{"op": "start", "span": "a"},
+             {"op": "start", "span": "a"}],                 # 重复开始
+            [{"op": "start", "span": "done"}],              # 已结束标识
+            [{"op": "finish", "span": "ghost"}],            # 不存在
+            [{"op": "start", "span": "a"},
+             {"op": "finish", "span": "a"},
+             {"op": "finish", "span": "a"}],                # 二次结束
+        ]
+        for events in cases:
+            t = Telemetry(iter(range(1000)).__next__)
+            t.counters = dict(existing.counters)
+            t.spans = {k: dict(v) for k, v in existing.spans.items()}
+            before = t.snapshot()
+            with self.assertRaises(ValueError, msg=repr(events)):
+                t.batch(events)
+            self.assertEqual(t.snapshot(), before, msg=repr(events))
+
+    def test_rejection_is_atomic_and_does_not_read_clock(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("before")
+        before = t.snapshot()
+
+        class AssertingClock:
+            reads = 0
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("clock must not be read on rejection")
+
+        t.clock = AssertingClock()
+        events = [
+            {"op": "inc", "name": "inbatch"},
+            {"op": "observe", "name": "m", "value": 3.0},
+            {"op": "start", "span": "s"},
+            {"op": "finish", "span": "s"},
+            {"op": "start", "span": "s"},  # 重复开始，整批拒绝
+        ]
+        with self.assertRaises(ValueError):
+            t.batch(events)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.query("open"), [])
+        self.assertEqual(AssertingClock.reads, 0)
+
+    def test_clock_exception_propagates_and_rolls_back(self):
+        class ClockError(RuntimeError):
+            pass
+
+        state = {"n": 0}
+
+        def clock():
+            state["n"] += 1
+            if state["n"] == 2:  # 第二个 start 的 clock 失败
+                raise ClockError("clock broke")
+            return float(state["n"])
+
+        t = Telemetry(clock)
+        t.inc("before")
+        before = t.snapshot()
+        with self.assertRaises(ClockError):
+            t.batch([
+                {"op": "start", "span": "a"},
+                {"op": "start", "span": "b"},
+            ])
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.query("open"), [])
+
+    def test_input_events_not_modified(self):
+        labels = [("b", 2), ("a", 1)]
+        events = [
+            {"op": "inc", "name": "c", "labels": labels, "value": 5},
+            {"op": "start", "span": "r", "parent": ("p",)},
+        ]
+        saved = copy.deepcopy(events)
+        t = Telemetry(iter(range(10)).__next__)
+        t.batch(events)
+        self.assertEqual(events, saved)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+        # 快照中标签已归一化；事后修改输入不影响聚合器
+        labels.append(("z", 9))
+        self.assertEqual(
+            t.snapshot()["counters"][0]["labels"], [("a", 1), ("b", 2)]
+        )
+
+    def test_no_new_snapshot_fields_and_coexists_with_restore_merge(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.batch([
+            {"op": "inc", "name": "h", "value": 2},
+            {"op": "observe", "name": "m", "value": 1.5},
+            {"op": "start", "span": "r"},
+            {"op": "finish", "span": "r", "error": 0},
+        ])
+        self.assertEqual(set(t.snapshot()), {"counters", "samples", "spans"})
+        # error=0（假值非 None）算异常，与逐条语义一致
+        self.assertEqual([e["span"] for e in t.query("error")], ["r"])
+        restored = Telemetry.from_snapshot(t.json())
+        self.assertEqual(restored.snapshot(), t.snapshot())
+        other = Telemetry()
+        self.assertIsNone(other.merge_snapshot(t.snapshot()))
+        self.assertEqual(other.snapshot(), t.snapshot())
+
+
 if __name__ == "__main__":
     unittest.main()

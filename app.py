@@ -87,47 +87,60 @@ class Telemetry:
     def inc(self, name, value=1, labels=(), service=None):
         service = self._service(service)
         labels = self._normalize_labels(labels)
-        key = (service, name, labels)
-        self.counters[key] = self.counters.get(key, 0) + value
+        self._apply_inc(self.counters, service, name, value, labels)
 
     def observe(self, name, value, labels=(), service=None):
         service = self._service(service)
         labels = self._normalize_labels(labels)
+        self._check_sample_value(value)
+        self._apply_observe(self.samples, service, name, value, labels)
+
+    @staticmethod
+    def _check_sample_value(value):
+        # observe 的样本入站规则：可转 float 且必须有限，原值由调用方保留。
         try:
             numeric = float(value)
         except (TypeError, ValueError):
             raise ValueError("sample value must be numeric")
         if math.isnan(numeric) or math.isinf(numeric):
             raise ValueError("sample value must be finite, got %r" % (value,))
-        key = (service, name, labels)
-        self.samples.setdefault(key, []).append(value)
+        return value
 
-    def start(self, span, parent=None, service=None):
-        # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
-        # 空字符串，显式传入必须是非空字符串；span 必须可哈希。任一校验
-        # 失败都不推进 clock、不留下半条记录。
-        service = self._service(service)
-        self._restore_hashable(span, "span")
+    @staticmethod
+    def _apply_inc(counters, service, name, value, labels):
+        # 计数器写入的唯一实现点，批量提交与逐条 inc 共用：
+        # 右值先算完再赋值，不可相加时原结构保持不变。
+        key = (service, name, labels)
+        counters[key] = counters.get(key, 0) + value
+
+    @staticmethod
+    def _apply_observe(samples, service, name, value, labels):
+        # 样本追加的唯一实现点，原值与写入顺序由列表保留。
+        key = (service, name, labels)
+        samples.setdefault(key, []).append(value)
+
+    @staticmethod
+    def _apply_start(spans, service, span, parent, timestamper):
+        # 跨度创建的唯一实现点：重复校验先于时间戳读取，
+        # timestamper 每次创建只被调用一次。
         key = (service, span)
-        # 跨度由 service 与 span 共同唯一标识：无论同标识跨度仍未结束还是
-        # 已经结束，重复开始一律拒绝，原有 parent/start/end/error 不被覆盖，
-        # clock 也不被推进。
-        if key in self.spans:
+        if key in spans:
             raise ValueError(
                 "span already exists for service=%r span=%r" % (service, span)
             )
-        self.spans[key] = {
+        spans[key] = {
             "parent": parent,
-            "start": self.clock(),
+            "start": timestamper(),
             "end": None,
             "error": None,
         }
 
-    def finish(self, span, error=None, service=None):
-        # 与 start 相同的入站校验顺序；被拒绝的调用不读取或生成时间戳。
-        service = self._service(service)
-        self._restore_hashable(span, "span")
-        record = self.spans.get((service, span))
+    @staticmethod
+    def _apply_finish(spans, service, span, error, timestamper):
+        # 跨度结束的唯一实现点：不存在与已结束的校验先于时间戳读取，
+        # timestamper 每次结束只被调用一次。
+        key = (service, span)
+        record = spans.get(key)
         if record is None:
             raise ValueError(
                 "span not found for service=%r span=%r" % (service, span)
@@ -136,8 +149,183 @@ class Telemetry:
             raise ValueError(
                 "span already finished for service=%r span=%r" % (service, span)
             )
-        record["end"] = self.clock()
+        record["end"] = timestamper()
         record["error"] = error
+
+    def start(self, span, parent=None, service=None):
+        # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
+        # 空字符串，显式传入必须是非空字符串；span 必须可哈希。任一校验
+        # 失败都不推进 clock、不留下半条记录。
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        # 跨度由 service 与 span 共同唯一标识：无论同标识跨度仍未结束还是
+        # 已经结束，重复开始一律拒绝，原有 parent/start/end/error 不被覆盖，
+        # clock 也不被推进。
+        self._apply_start(self.spans, service, span, parent, self.clock)
+
+    def finish(self, span, error=None, service=None):
+        # 与 start 相同的入站校验顺序；被拒绝的调用不读取或生成时间戳。
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        self._apply_finish(self.spans, service, span, error, self.clock)
+
+    # ------------------------------------------------------------------
+    # 离线批量回放
+    # ------------------------------------------------------------------
+
+    # 每种 op 允许出现的字段（op 本身单独处理）；字段缺省时沿用公开入口
+    # 的默认值，因此这里列的是“允许”而非“必须”，必需字段另见
+    # _BATCH_REQUIRED。
+    _BATCH_FIELDS = {
+        "inc": {"name", "value", "labels", "service"},
+        "observe": {"name", "value", "labels", "service"},
+        "start": {"span", "parent", "service"},
+        "finish": {"span", "error", "service"},
+    }
+
+    # 公开入口中没有默认值、必须显式给出的字段：inc 的 value 缺省为 1，
+    # observe 的 value 是位置参数无默认，name/span 始终必需。
+    _BATCH_REQUIRED = {
+        "inc": {"name"},
+        "observe": {"name", "value"},
+        "start": {"span"},
+        "finish": {"span"},
+    }
+
+    def batch(self, events):
+        """按输入顺序原子提交一批离线事件，成功返回 None。
+
+        events 必须是事件对象（dict）组成的列表或元组；每个事件以 op
+        指定 inc/observe/start/finish，其余字段沿用对应公开入口的名称、
+        默认值与校验规则，批次内后续事件可使用前面事件刚建立的跨度。
+        成功后 snapshot/json/query/trace 的结果与按同一顺序逐条调用
+        inc/observe/start/finish 完全一致，每个 start/finish 仍只读取
+        一次 clock。空批次视为成功且不改变状态。
+
+        原子性：先在影子状态上完成全部结构校验、入站校验与生命周期
+        模拟（重复开始、结束不存在或已结束的跨度等），该阶段不读取
+        clock、不接触 self 的聚合；任一事件不合法统一抛 ValueError。
+        全部通过后才在状态副本上按计划提交并一次性发布，提交阶段
+        clock 自身抛出的异常原样传播，counter/sample/span 与 clock
+        配置保持调用前状态。传入的事件对象及其标签、值均不被修改。
+        """
+        if not isinstance(events, (list, tuple)):
+            raise ValueError("events must be a list or tuple of event objects")
+        if len(events) == 0:  # 空批次成功：不复制、不读 clock、不改变状态
+            return None
+        actions = self._batch_plan(events)
+        # 提交在副本上进行，全部动作成功后才一次性发布；clock 异常时
+        # 局部副本被丢弃，self 仍指向调用前的结构。inc/observe 与逐条
+        # 调用一样不读 clock，因此 clock 调用次序与逐条序列完全相同。
+        counters = dict(self.counters)
+        samples = {key: list(values) for key, values in self.samples.items()}
+        spans = {key: dict(record) for key, record in self.spans.items()}
+        for action in actions:
+            kind = action[0]
+            if kind == "inc":
+                _, service, name, value, labels = action
+                self._apply_inc(counters, service, name, value, labels)
+            elif kind == "observe":
+                _, service, name, value, labels = action
+                self._apply_observe(samples, service, name, value, labels)
+            elif kind == "start":
+                _, service, span, parent = action
+                self._apply_start(spans, service, span, parent, self.clock)
+            else:
+                _, service, span, error = action
+                self._apply_finish(spans, service, span, error, self.clock)
+        self.counters = counters
+        self.samples = samples
+        self.spans = spans
+        return None
+
+    def _batch_plan(self, events):
+        # 在影子状态上按顺序预演整批事件，产出与 self 无关的动作清单。
+        # 这里绝不调用 clock：start/finish 使用非 None 的占位时间戳，
+        # 以便“已结束跨度不能二次结束”等依赖 end 非空的判断照常生效。
+        planned = object()
+        counters = dict(self.counters)
+        samples = {key: list(values) for key, values in self.samples.items()}
+        spans = {key: dict(record) for key, record in self.spans.items()}
+        actions = []
+        for index, event in enumerate(events):
+            try:
+                if not isinstance(event, dict):
+                    raise ValueError(
+                        "event at index %d must be an event object" % index
+                    )
+                if "op" not in event:
+                    raise ValueError(
+                        "event at index %d is missing 'op'" % index
+                    )
+                op = event["op"]
+                if op not in self._BATCH_FIELDS:
+                    raise ValueError(
+                        "event at index %d has unknown op: %r" % (index, op)
+                    )
+                fields = set(event)
+                allowed = self._BATCH_FIELDS[op] | {"op"}
+                unknown = fields - allowed
+                if unknown:
+                    raise ValueError(
+                        "event at index %d has unknown fields for op %r: %r"
+                        % (index, op, sorted(unknown, key=repr))
+                    )
+                missing = self._BATCH_REQUIRED[op] - fields
+                if missing:
+                    raise ValueError(
+                        "event at index %d for op %r is missing required"
+                        " fields: %r" % (index, op, sorted(missing, key=repr))
+                    )
+                if op == "inc":
+                    # 校验顺序与 inc 一致：service、labels，随后在影子上相加；
+                    # value 缺省为 1。影子相加同时充当 value 的运算校验
+                    # （不可相加的事件在本阶段即被拒绝）。
+                    service = self._service(event.get("service"))
+                    labels = self._normalize_labels(event.get("labels", ()))
+                    name = event["name"]
+                    value = event.get("value", 1)
+                    self._apply_inc(counters, service, name, value, labels)
+                    actions.append(("inc", service, name, value, labels))
+                elif op == "observe":
+                    # 与 observe 一致：service、labels、有限数值检查，再追加。
+                    service = self._service(event.get("service"))
+                    labels = self._normalize_labels(event.get("labels", ()))
+                    name = event["name"]
+                    value = event["value"]
+                    self._check_sample_value(value)
+                    self._apply_observe(samples, service, name, value, labels)
+                    actions.append(("observe", service, name, value, labels))
+                elif op == "start":
+                    # 与 start 一致：service、span 可哈希，再在影子上查重。
+                    service = self._service(event.get("service"))
+                    span = event["span"]
+                    self._restore_hashable(span, "span")
+                    parent = event.get("parent", None)
+                    self._apply_start(
+                        spans, service, span, parent, lambda: planned
+                    )
+                    actions.append(("start", service, span, parent))
+                else:
+                    # 与 finish 一致：service、span 可哈希，再查不存在/已结束。
+                    service = self._service(event.get("service"))
+                    span = event["span"]
+                    self._restore_hashable(span, "span")
+                    error = event.get("error", None)
+                    self._apply_finish(
+                        spans, service, span, error, lambda: planned
+                    )
+                    actions.append(("finish", service, span, error))
+            except ValueError:
+                raise
+            except Exception as exc:
+                # 不可哈希 op/name、计数器值不可相加、事件对象的键枚举
+                # 异常等底层错误同样属于事件被拒绝，按批量契约统一为
+                # ValueError（影子状态随异常丢弃）。
+                raise ValueError(
+                    "event at index %d is invalid: %s" % (index, exc)
+                )
+        return actions
 
     @staticmethod
     def _span_entry(service, span, record):
