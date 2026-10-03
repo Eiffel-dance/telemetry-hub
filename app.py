@@ -779,6 +779,159 @@ class Telemetry:
         self.spans = merged_spans
         return None
 
+    # ------------------------------------------------------------------
+    # 离线快照差异查询
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def diff_snapshots(cls, before, after):
+        """比较两份离线快照，返回 added/removed/changed 三类差异。
+
+        两个输入接受的范围与 from_snapshot 完全一致：snapshot() 返回的
+        字典、json() 产生的 JSON 文本或 UTF-8 字节，并沿用恢复入口相同的
+        严格 JSON、字段集合、重复记录、标签归一化与可哈希标识规则。方法
+        只读两个输入：不读取 clock、不发送网络、不修改任何输入对象；任一
+        输入无效都统一抛 ValueError，且在抛出前不返回部分结果。
+
+        返回全新的 JSON 可序列化字典，顶层只有 counters、samples、spans，
+        每项只含 added、removed、changed 三个数组。counter/sample 以
+        service、name、labels 的完整组合定位，span 以 service、span 定位：
+        只出现在 after 的完整记录进入 added，只出现在 before 的进入
+        removed；同一定位但完整字段或样本统计不同的进入 changed，changed
+        元素只给出相互独立的 before、after 两份完整记录。样本按 values 与
+        现有公开浮点统计重新归一后再比较，输入携带或省略等价统计不会误报；
+        跨度从 open 到 closed、error 变化、parent 变化都算 changed。
+        added/removed 沿用对应快照的稳定排序，changed 按 after 记录的快照
+        排序，空差异为空数组；返回的记录与嵌套标签可安全修改，不影响输入。
+        """
+        # 先完整解析并校验两边（先 before 后 after），任一无效都在此抛出，
+        # 之后才构造任何结果，绝不返回部分差异；解析对字典深拷贝、对文本
+        # 重建结构，后续比较与输出都不接触调用方的输入对象。整个方法是
+        # classmethod：没有实例、没有 clock，也不发送任何网络请求。
+        before_counters, before_samples, before_spans = cls._restore_validate(
+            cls._restore_parse(before)
+        )
+        after_counters, after_samples, after_spans = cls._restore_validate(
+            cls._restore_parse(after)
+        )
+        return {
+            "counters": cls._diff_map(
+                before_counters,
+                after_counters,
+                cls._diff_counter_entry,
+                lambda left, right: left != right,
+                lambda item: _OrderableTuple(item[0]),
+            ),
+            "samples": cls._diff_map(
+                before_samples,
+                after_samples,
+                cls._diff_sample_entry,
+                cls._diff_sample_changed,
+                lambda item: _OrderableTuple(item[0]),
+            ),
+            "spans": cls._diff_map(
+                before_spans,
+                after_spans,
+                cls._diff_span_entry,
+                cls._diff_span_changed,
+                # 与 _span_entries 相同的服务、开始时间、标识快照顺序。
+                lambda item: _OrderableTuple(
+                    (item[0][0], item[1]["start"], item[0][1])
+                ),
+            ),
+        }
+
+    @staticmethod
+    def _diff_map(before, after, entry_of, differs, sort_key):
+        # 按键比较两份校验后的内部映射：added 沿用 after 快照顺序、
+        # removed 沿用 before 快照顺序、changed 按 after 快照顺序。两边
+        # 记录先按各自快照键排序，输入数组的原始排列不影响输出顺序。
+        # entry_of 每次都重建完整记录（thaw 标签、深拷贝值），同一条
+        # changed 记录的 before/after 以及结果与输入之间互不共享。
+        before_keys = set(before)
+        after_keys = set(after)
+        before_sorted = sorted(before.items(), key=sort_key)
+        after_sorted = sorted(after.items(), key=sort_key)
+        added = [
+            entry_of(key, value)
+            for key, value in after_sorted
+            if key not in before_keys
+        ]
+        removed = [
+            entry_of(key, value)
+            for key, value in before_sorted
+            if key not in after_keys
+        ]
+        changed = []
+        for key, after_value in after_sorted:
+            if key in before_keys and differs(before[key], after_value):
+                changed.append({
+                    "before": entry_of(key, before[key]),
+                    "after": entry_of(key, after_value),
+                })
+        return {"added": added, "removed": removed, "changed": changed}
+
+    @staticmethod
+    def _diff_counter_entry(key, value):
+        # 完整计数器记录，形态与 snapshot() 逐项一致；value 理论上是
+        # 不可变 JSON 标量，深拷贝保证容器型合法值也不与输入共享。
+        service, name, labels = key
+        return {
+            "service": service,
+            "name": copy.deepcopy(name),
+            "labels": _thaw_labels(labels),
+            "value": copy.deepcopy(value),
+        }
+
+    @staticmethod
+    def _diff_sample_entry(key, values):
+        # 完整样本记录：统计不取自输入，而是按公开浮点规则从 values 重算，
+        # 因此携带/省略/键序不同的等价统计在差异两侧呈现同一份形态。
+        service, name, labels = key
+        entry = {
+            "service": service,
+            "name": copy.deepcopy(name),
+            "labels": _thaw_labels(labels),
+            "values": copy.deepcopy(values),
+        }
+        if values:  # 空样本与 snapshot() 一样不附加统计字段
+            entry.update(Telemetry._sample_stats(values))
+        return entry
+
+    @staticmethod
+    def _diff_sample_changed(before_values, after_values):
+        # 比较前样本已按恢复入口同一规则校验（统计须与 values 一致），这里
+        # 再以 values 与公开浮点统计的归一结果判定：统计完全由 values 按
+        # 确定的浮点规则导出，values 完整相等时重算统计必然相等，输入是否
+        # 携带统计字段或字段顺序如何都不会误报变化；values 任一原值不同
+        # （完整记录不同）即 changed。
+        return before_values != after_values
+
+    @staticmethod
+    def _diff_span_entry(key, record):
+        # 完整跨度记录，字段集合与顺序和 _span_entry 保持一致；所有可能为
+        # 容器的字段都深拷贝，输出记录与两侧内部存储互不共享。
+        service, span = key
+        return {
+            "span": copy.deepcopy(span),
+            "service": service,
+            "parent": copy.deepcopy(record["parent"]),
+            "start": copy.deepcopy(record["start"]),
+            "end": copy.deepcopy(record["end"]),
+            "error": copy.deepcopy(record["error"]),
+        }
+
+    @staticmethod
+    def _diff_span_changed(before, after):
+        # parent/start/end/error 任一不同即 changed：open→closed（end 由
+        # None 变为结束值）、error 变化、parent 变化都落入这一判定。
+        return (
+            before["parent"] != after["parent"]
+            or before["start"] != after["start"]
+            or before["end"] != after["end"]
+            or before["error"] != after["error"]
+        )
+
     @staticmethod
     def _restore_pairs_hook(pairs):
         # object_pairs_hook：JSON 文本层面的重复键一律拒绝。
