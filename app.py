@@ -66,9 +66,46 @@ class Telemetry:
         return service
 
     @staticmethod
+    def _freeze_label_value(value):
+        # 把任意合法 JSON 标签值冻结为可哈希的规范形式：标量原样保留
+        # （既有可哈希标签的聚合键与快照文本完全不变），数组按顺序冻结为
+        # 带 "list" 标记的元组，对象按键排序后冻结为带 "dict" 标记的
+        # 键值对元组。相同 JSON 内容（对象键序无关、数组顺序相关）冻结
+        # 结果相同，因此嵌套数组/对象标签也能聚合到同一键。
+        if isinstance(value, dict):
+            items = [
+                (key, Telemetry._freeze_label_value(item))
+                for key, item in value.items()
+            ]
+            items.sort(key=lambda pair: _Orderable(pair[0]))
+            return ("dict",) + tuple(items)
+        if isinstance(value, (list, tuple)):
+            return ("list",) + tuple(
+                Telemetry._freeze_label_value(item) for item in value
+            )
+        return value
+
+    @staticmethod
+    def _thaw_label_value(value):
+        # _freeze_label_value 的逆变换：把规范键中的冻结值还原为原始
+        # JSON 结构（新建列表/字典，与内部状态不共享可变对象）；标量在
+        # 冻结时未变形，原样返回。冻结空间里元组只可能是带标记的容器，
+        # 标量值永远不会是元组，因此标记判别无歧义。
+        if isinstance(value, tuple):
+            if value[0] == "dict":
+                return {
+                    key: Telemetry._thaw_label_value(item)
+                    for key, item in value[1:]
+                }
+            return [Telemetry._thaw_label_value(item) for item in value[1:]]
+        return value
+
+    @staticmethod
     def _normalize_labels(labels):
-        # 标签按键的字典序归一化；重复键或不可 JSON 序列化一律 ValueError，
-        # 调用方在校验通过前不会写入任何聚合。
+        # 标签按键的字典序归一化；重复键或不可严格 JSON 序列化一律
+        # ValueError，调用方在校验通过前不会写入任何聚合。值可以是任意
+        # 有限 JSON 标量、数组或对象：校验通过后递归冻结为可哈希的规范
+        # 形式，不可哈希的数组/对象标签同样能作为聚合键。
         try:
             pairs = []
             seen = set()
@@ -80,9 +117,14 @@ class Telemetry:
                 pairs.append((key, value))
             pairs.sort(key=lambda pair: pair[0])
             json.dumps(pairs, allow_nan=False)
+            normalized = tuple(
+                (key, Telemetry._freeze_label_value(value))
+                for key, value in pairs
+            )
+            hash(normalized)  # 防御异常常量：规范键必须整体可哈希
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid labels: %s" % (exc,))
-        return tuple(pairs)
+        return normalized
 
     def inc(self, name, value=1, labels=(), service=None):
         service = self._service(service)
@@ -550,7 +592,10 @@ class Telemetry:
             counters.append({
                 "service": svc,
                 "name": name,
-                "labels": list(key_labels),
+                "labels": [
+                    (label_key, self._thaw_label_value(label_value))
+                    for label_key, label_value in key_labels
+                ],
                 "value": value,
             })
 
@@ -566,7 +611,10 @@ class Telemetry:
             entry = {
                 "service": svc,
                 "name": name,
-                "labels": list(key_labels),
+                "labels": [
+                    (label_key, self._thaw_label_value(label_value))
+                    for label_key, label_value in key_labels
+                ],
                 "values": list(values),
             }
             if values:  # 空样本不产生统计；统计只对命中序列按原规则重算
@@ -809,10 +857,9 @@ class Telemetry:
         for item in labels:
             if not isinstance(item, (list, tuple)) or len(item) != 2:
                 raise ValueError("labels must be an array of pairs")
-        # 复用既有归一化：排序、重复键与可 JSON 序列化校验一致。
-        normalized = cls._normalize_labels(labels)
-        cls._restore_hashable(normalized, "labels")
-        return normalized
+        # 复用既有归一化：排序、重复键与严格 JSON 校验一致，嵌套数组/对象
+        # 值同样冻结为可哈希规范键，恢复与合并按同一等价规则匹配。
+        return cls._normalize_labels(labels)
 
     @staticmethod
     def _restore_sample_value(value):
