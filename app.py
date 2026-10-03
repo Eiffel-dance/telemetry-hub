@@ -49,6 +49,64 @@ class _OrderableTuple:
         return False
 
 
+class _FrozenKind:
+    """冻结标签值时区分数组与对象的标记。标量原样保留，容器递归冻结为
+    可哈希元组；标记提供稳定 repr，保证混合标签下快照排序仍然确定。"""
+
+    __slots__ = ("kind",)
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def __repr__(self):
+        return "<frozen-%s>" % (self.kind,)
+
+
+_FROZEN_ARRAY = _FrozenKind("array")
+_FROZEN_OBJECT = _FrozenKind("object")
+
+
+def _freeze_json(value):
+    """把任意合法 JSON 值冻结为可哈希的规范形式。
+
+    标量原样返回（既有可哈希标量标签的聚合键与输出保持不变）；数组
+    （含元组）按顺序递归冻结，元素顺序仍然区分不同标签；对象按键排序
+    后递归冻结，键顺序不影响聚合相等性。冻结只构造新结构，不改动
+    调用方对象。键不可比较的混合类型对象在此抛出 TypeError，由
+    _normalize_labels 统一转换为 ValueError。
+    """
+    if isinstance(value, (list, tuple)):
+        return (_FROZEN_ARRAY, tuple(_freeze_json(item) for item in value))
+    if isinstance(value, dict):
+        items = sorted(value.items(), key=lambda item: item[0])
+        return (
+            _FROZEN_OBJECT,
+            tuple((key, _freeze_json(item)) for key, item in items),
+        )
+    return value
+
+
+def _thaw_json(value):
+    """_freeze_json 的逆变换：从冻结形式重建原始 JSON 结构。
+
+    每次调用都产生全新的数组/对象，返回值与内部冻结状态互不共享；
+    标量原样返回。
+    """
+    if isinstance(value, tuple) and len(value) == 2:
+        marker, payload = value
+        if marker is _FROZEN_ARRAY:
+            return [_thaw_json(item) for item in payload]
+        if marker is _FROZEN_OBJECT:
+            return {key: _thaw_json(item) for key, item in payload}
+    return value
+
+
+def _thaw_labels(labels):
+    # 快照输出：按键序返回原始 JSON 结构，每项仍是 (键, 值) 元组，
+    # 数组/对象值重建为全新对象，与内部冻结形式互不共享。
+    return [(key, _thaw_json(value)) for key, value in labels]
+
+
 class Telemetry:
     def __init__(self, clock=time.time):
         self.clock = clock
@@ -67,8 +125,12 @@ class Telemetry:
 
     @staticmethod
     def _normalize_labels(labels):
-        # 标签按键的字典序归一化；重复键或不可 JSON 序列化一律 ValueError，
-        # 调用方在校验通过前不会写入任何聚合。
+        # 标签按键的字典序归一化；重复键、键排序失败或不可严格 JSON
+        # 表示一律 ValueError，调用方在校验通过前不会写入任何聚合。
+        # 值可以是任意有限 JSON 标量、数组或对象：标量原样进入聚合键
+        # （既有行为不变），数组/对象递归冻结为可哈希的规范形式——
+        # 对象键顺序不造成差异，数组顺序仍然区分不同标签；冻结只构造
+        # 新结构，不改写调用方对象。
         try:
             pairs = []
             seen = set()
@@ -80,9 +142,11 @@ class Telemetry:
                 pairs.append((key, value))
             pairs.sort(key=lambda pair: pair[0])
             json.dumps(pairs, allow_nan=False)
+            return tuple(
+                (key, _freeze_json(value)) for key, value in pairs
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid labels: %s" % (exc,))
-        return tuple(pairs)
 
     def inc(self, name, value=1, labels=(), service=None):
         service = self._service(service)
@@ -550,7 +614,7 @@ class Telemetry:
             counters.append({
                 "service": svc,
                 "name": name,
-                "labels": list(key_labels),
+                "labels": _thaw_labels(key_labels),
                 "value": value,
             })
 
@@ -566,7 +630,7 @@ class Telemetry:
             entry = {
                 "service": svc,
                 "name": name,
-                "labels": list(key_labels),
+                "labels": _thaw_labels(key_labels),
                 "values": list(values),
             }
             if values:  # 空样本不产生统计；统计只对命中序列按原规则重算
@@ -809,10 +873,9 @@ class Telemetry:
         for item in labels:
             if not isinstance(item, (list, tuple)) or len(item) != 2:
                 raise ValueError("labels must be an array of pairs")
-        # 复用既有归一化：排序、重复键与可 JSON 序列化校验一致。
-        normalized = cls._normalize_labels(labels)
-        cls._restore_hashable(normalized, "labels")
-        return normalized
+        # 复用既有归一化：排序、重复键与严格 JSON 校验一致；数组/对象值
+        # 冻结为可哈希规范形式后与写入路径使用同一聚合键。
+        return cls._normalize_labels(labels)
 
     @staticmethod
     def _restore_sample_value(value):
