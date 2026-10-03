@@ -403,16 +403,36 @@ class Telemetry:
         }
 
     def _span_entries(self):
-        entries = [
-            self._span_entry(service, span, record)
-            for (service, span), record in self.spans.items()
+        # query 使用的无筛选跨度条目，保持既有排序；快照筛选与差异查询
+        # 统一走 _span_snapshot_pairs。
+        return [entry for _, entry in self._span_snapshot_pairs(self.spans)]
+
+    @staticmethod
+    def _span_snapshot_pairs(spans, service=None, status=None):
+        # 跨度快照条目的唯一构造点：按服务、开始时间、标识稳定排序，
+        # 返回 (service, span) 定位键与完整记录。service/status 筛选与
+        # snapshot 原有筛选逐项一致，缺省（None）即不限制。
+        pairs = [
+            ((svc, span), Telemetry._span_entry(svc, span, record))
+            for (svc, span), record in spans.items()
         ]
-        entries.sort(
-            key=lambda entry: _OrderableTuple(
-                (entry["service"], entry["start"], entry["span"])
+        pairs.sort(
+            key=lambda pair: _OrderableTuple(
+                (
+                    pair[1]["service"],
+                    pair[1]["start"],
+                    pair[1]["span"],
+                )
             )
         )
-        return entries
+        if service is None and status is None:
+            return pairs
+        return [
+            (key, entry)
+            for key, entry in pairs
+            if (service is None or entry["service"] == service)
+            and Telemetry._span_matches_status(entry, status)
+        ]
 
     def query(self, status):
         # open：end 仍为空；closed：end 已写入（成功结束与带异常结束都包含，
@@ -602,25 +622,64 @@ class Telemetry:
         if labels is not None:
             labels = self._normalize_labels(labels)
 
-        counters = []
+        counters = [
+            entry
+            for _, entry in self._counter_snapshot_pairs(
+                self.counters, service, labels
+            )
+        ]
+        samples = [
+            entry
+            for _, entry in self._sample_snapshot_pairs(
+                self.samples, service, labels
+            )
+        ]
+        spans = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status
+            )
+        ]
+
+        return {
+            "counters": counters,
+            "samples": samples,
+            "spans": spans,
+        }
+
+    @staticmethod
+    def _counter_snapshot_pairs(counters, service=None, labels=None):
+        # 计数器快照条目的唯一构造点：按服务、名称、标签稳定排序，
+        # 返回 ((service, name, labels 冻结键), 完整记录)。service/labels
+        # 筛选与 snapshot 原有筛选逐项一致，缺省（None）即不限制。
+        pairs = []
         for (svc, name, key_labels), value in sorted(
-            self.counters.items(),
+            counters.items(),
             key=lambda item: _OrderableTuple(item[0]),
         ):
             if service is not None and svc != service:
                 continue
             if labels is not None and key_labels != labels:
                 continue
-            counters.append({
-                "service": svc,
-                "name": name,
-                "labels": _thaw_labels(key_labels),
-                "value": value,
-            })
+            pairs.append((
+                (svc, name, key_labels),
+                {
+                    "service": svc,
+                    "name": name,
+                    "labels": _thaw_labels(key_labels),
+                    "value": value,
+                },
+            ))
+        return pairs
 
-        samples = []
+    @staticmethod
+    def _sample_snapshot_pairs(samples, service=None, labels=None):
+        # 样本快照条目的唯一构造点：按服务、名称、标签稳定排序，
+        # 返回 ((service, name, labels 冻结键), 完整记录)。统计对非空
+        # values 按原规则重算，空 values 不附加统计字段。
+        pairs = []
         for (svc, name, key_labels), values in sorted(
-            self.samples.items(),
+            samples.items(),
             key=lambda item: _OrderableTuple(item[0]),
         ):
             if service is not None and svc != service:
@@ -634,22 +693,9 @@ class Telemetry:
                 "values": list(values),
             }
             if values:  # 空样本不产生统计；统计只对命中序列按原规则重算
-                entry.update(self._sample_stats(values))
-            samples.append(entry)
-
-        spans = []
-        for entry in self._span_entries():
-            if service is not None and entry["service"] != service:
-                continue
-            if not self._span_matches_status(entry, status):
-                continue
-            spans.append(entry)
-
-        return {
-            "counters": counters,
-            "samples": samples,
-            "spans": spans,
-        }
+                entry.update(Telemetry._sample_stats(values))
+            pairs.append(((svc, name, key_labels), entry))
+        return pairs
 
     @staticmethod
     def _is_json_strict(value):
@@ -778,6 +824,86 @@ class Telemetry:
         self.samples = merged_samples
         self.spans = merged_spans
         return None
+
+    # ------------------------------------------------------------------
+    # 离线快照差异
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def diff_snapshots(cls, before, after):
+        """只读比较两份离线快照，返回 added/removed/changed 差异字典。
+
+        两个输入都接受 snapshot() 返回的字典、json() 产生的 JSON 文本或
+        UTF-8 字节，按 from_snapshot/merge_snapshot 相同的严格 JSON、字段、
+        重复记录、标签与可哈希标识规则解析，任一输入无效统一抛 ValueError，
+        且在抛出前不返回任何结果、不修改输入对象。查询纯只读：不读取 clock、
+        不联网、不改变任何输入。
+
+        返回全新的、可 JSON 序列化的字典，顶层只有 counters、samples、spans，
+        每一项都只含 added、removed、changed 三个数组。counter/sample 以
+        service、name、labels 的完整组合定位，span 以 service、span 定位：
+        只出现在 after 的完整记录进入 added，只出现在 before 的进入 removed，
+        同一定位但内容不同的进入 changed（元素为 {"before": ..., "after": ...}
+        两份相互独立的完整记录）。样本先按 values 与公开浮点统计重新归一再
+        比较，输入携带或省略等价统计字段不算变化；跨度 open→closed、error
+        变化、parent 变化等任何字段差异都算 changed。added/removed 沿用各
+        自快照的稳定排序，changed 按 after 记录的快照排序；无差异对应数组
+        为空。返回的记录与嵌套标签均可安全修改，与两个输入互不共享。
+        """
+        before_data = cls._restore_parse(before)
+        # 两边先全部解析并校验完成，之后才构造任何差异输出：任一输入无效
+        # 都不会返回部分结果。
+        after_data = cls._restore_parse(after)
+        before_state = cls._restore_validate(before_data)
+        after_state = cls._restore_validate(after_data)
+
+        def diff_section(before_pairs, after_pairs):
+            before_map = dict(before_pairs)
+            after_map = dict(after_pairs)
+            added = [
+                entry
+                for key, entry in after_pairs
+                if key not in before_map
+            ]
+            removed = [
+                entry
+                for key, entry in before_pairs
+                if key not in after_map
+            ]
+            changed = []
+            for key, after_entry in after_pairs:
+                before_entry = before_map.get(key)
+                if before_entry is None:
+                    continue
+                if before_entry != after_entry:
+                    changed.append(
+                        {"before": before_entry, "after": after_entry}
+                    )
+            return {
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+            }
+
+        before_counters, before_samples, before_spans = before_state
+        after_counters, after_samples, after_spans = after_state
+        result = {
+            "counters": diff_section(
+                cls._counter_snapshot_pairs(before_counters),
+                cls._counter_snapshot_pairs(after_counters),
+            ),
+            "samples": diff_section(
+                cls._sample_snapshot_pairs(before_samples),
+                cls._sample_snapshot_pairs(after_samples),
+            ),
+            "spans": diff_section(
+                cls._span_snapshot_pairs(before_spans),
+                cls._span_snapshot_pairs(after_spans),
+            ),
+        }
+        # 再深拷贝一次切断与解析中间结构的引用（条目本身已是新建对象，
+        # 这里保证容器层级同样全新独立，且结果严格可 JSON 序列化）。
+        return copy.deepcopy(result)
 
     @staticmethod
     def _restore_pairs_hook(pairs):

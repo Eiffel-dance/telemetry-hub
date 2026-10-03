@@ -1011,5 +1011,306 @@ class TelemetrySnapshotFilterTest(unittest.TestCase):
         )
 
 
+class TelemetryDiffTest(unittest.TestCase):
+    def build_before(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("hits", 2)
+        t.inc("gone", 9, service="api")
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.start("r1")
+        t.finish("r1", error="boom")
+        t.start("open1", service="api")
+        return t
+
+    def build_after(self):
+        t = Telemetry(iter(range(200)).__next__)
+        t.inc("hits", 5)                              # counter changed
+        t.inc("new", 7)                               # counter added
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.observe("lat", "3.5", service="api")        # sample changed
+        t.start("r1")
+        t.finish("r1", error="boom")                  # identical span
+        t.start("open1", service="api")
+        t.finish("open1", service="api")              # open -> closed
+        t.start("added-span", service="web")
+        return t
+
+    def test_top_level_shape_and_empty_diff(self):
+        t = self.build_before()
+        d = Telemetry.diff_snapshots(t.snapshot(), t.snapshot())
+        self.assertEqual(set(d), {"counters", "samples", "spans"})
+        for section in d.values():
+            self.assertEqual(set(section), {"added", "removed", "changed"})
+            self.assertEqual(section, {"added": [], "removed": [], "changed": []})
+        # 自己与自己（JSON 文本形式）也无差异
+        self.assertEqual(
+            Telemetry.diff_snapshots(t.json(), t.json()),
+            {"counters": {"added": [], "removed": [], "changed": []},
+             "samples": {"added": [], "removed": [], "changed": []},
+             "spans": {"added": [], "removed": [], "changed": []}},
+        )
+
+    def test_added_removed_changed_classification(self):
+        before = self.build_before().snapshot()
+        after = self.build_after().snapshot()
+        d = Telemetry.diff_snapshots(before, after)
+
+        self.assertEqual(
+            [(c["service"], c["name"]) for c in d["counters"]["added"]],
+            [("", "new")],
+        )
+        self.assertEqual(
+            [(c["service"], c["name"]) for c in d["counters"]["removed"]],
+            [("api", "gone")],
+        )
+        changed = d["counters"]["changed"]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["before"]["value"], 2)
+        self.assertEqual(changed[0]["after"]["value"], 5)
+        self.assertEqual(
+            {c["name"] for c in changed[0].values()}, {"hits"}
+        )
+        self.assertEqual(set(changed[0]), {"before", "after"})
+
+        self.assertEqual(d["samples"]["added"], [])
+        self.assertEqual(d["samples"]["removed"], [])
+        sample_changed = d["samples"]["changed"]
+        self.assertEqual(len(sample_changed), 1)
+        self.assertEqual(sample_changed[0]["before"]["values"], [1, 2.5])
+        self.assertEqual(sample_changed[0]["after"]["values"], [1, 2.5, "3.5"])
+
+        self.assertEqual(
+            [(x["service"], x["span"]) for x in d["spans"]["added"]],
+            [("web", "added-span")],
+        )
+        self.assertEqual(d["spans"]["removed"], [])
+        span_changed = d["spans"]["changed"]
+        self.assertEqual(len(span_changed), 1)
+        entry = span_changed[0]
+        self.assertEqual(entry["before"]["span"], "open1")
+        self.assertIsNone(entry["before"]["end"])
+        self.assertIsNotNone(entry["after"]["end"])
+        # 完全一致的跨度 r1 不出现在任何数组
+        for bucket in ("added", "removed", "changed"):
+            self.assertNotIn(
+                "r1",
+                [x.get("span", x.get("after", {}).get("span"))
+                 for x in d["spans"][bucket]],
+            )
+
+    def test_accepts_dict_text_and_bytes(self):
+        before = self.build_before()
+        after = self.build_after()
+        expected = Telemetry.diff_snapshots(before.snapshot(), after.snapshot())
+        variants = (
+            (before.json(), after.json()),
+            (before.json().encode("utf-8"), after.json().encode("utf-8")),
+            (before.snapshot(), after.json()),
+            (before.json().encode("utf-8"), after.snapshot()),
+        )
+        for raw_before, raw_after in variants:
+            self.assertEqual(
+                Telemetry.diff_snapshots(raw_before, raw_after), expected
+            )
+
+    def test_sample_stats_renormalized_before_comparison(self):
+        base = {"counters": [], "spans": []}
+        no_stats = dict(base, samples=[
+            {"service": "", "name": "m", "labels": [], "values": [1, 2.5]},
+        ])
+        with_stats = dict(base, samples=[{
+            "service": "", "name": "m", "labels": [], "values": [1, 2.5],
+            "count": 2, "sum": 3.5, "minimum": 1.0,
+            "maximum": 2.5, "mean": 1.75,
+        }])
+        # 携带与省略等价统计、键序不同都不应报变化
+        self.assertEqual(
+            Telemetry.diff_snapshots(no_stats, with_stats)["samples"],
+            {"added": [], "removed": [], "changed": []},
+        )
+        self.assertEqual(
+            Telemetry.diff_snapshots(with_stats, no_stats)["samples"],
+            {"added": [], "removed": [], "changed": []},
+        )
+        # changed 记录始终带按公开规则重算的完整统计（before 省略也补齐）
+        grown = dict(base, samples=[
+            {"service": "", "name": "m", "labels": [], "values": [1, 2.5, 4]},
+        ])
+        changed = Telemetry.diff_snapshots(no_stats, grown)["samples"]["changed"]
+        self.assertEqual(len(changed), 1)
+        for side in ("before", "after"):
+            self.assertEqual(
+                set(changed[0][side]),
+                {"service", "name", "labels", "values",
+                 "count", "sum", "minimum", "maximum", "mean"},
+            )
+        self.assertEqual(changed[0]["before"]["mean"], 1.75)
+        # 标签键序不同但归一化后相同，不算不同记录
+        reordered = dict(base, samples=[{
+            "service": "", "name": "m",
+            "labels": [["b", 2], ["a", 1]],
+            "values": [1, 2.5],
+        }])
+        canonical = dict(base, samples=[{
+            "service": "", "name": "m",
+            "labels": [["a", 1], ["b", 2]],
+            "values": [1, 2.5],
+        }])
+        self.assertEqual(
+            Telemetry.diff_snapshots(reordered, canonical)["samples"]["changed"],
+            [],
+        )
+
+    def test_span_field_changes_count_as_changed(self):
+        head = {"counters": [], "samples": []}
+        open_span = {"span": "s", "service": "", "parent": None,
+                     "start": 0, "end": None, "error": None}
+        cases = [
+            dict(open_span, end=1),                    # open -> closed
+            dict(open_span, parent="p"),               # parent 变化
+            dict(open_span, error="e"),                # error 变化（仍 open）
+            dict(open_span, start=5),                  # start 变化
+        ]
+        for changed_record in cases:
+            d = Telemetry.diff_snapshots(
+                dict(head, spans=[open_span]),
+                dict(head, spans=[changed_record]),
+            )
+            self.assertEqual(len(d["spans"]["changed"]), 1, msg=changed_record)
+            self.assertEqual(d["spans"]["added"], [])
+            self.assertEqual(d["spans"]["removed"], [])
+        # error=0（假值非 None）与 None 也算变化
+        d = Telemetry.diff_snapshots(
+            dict(head, spans=[dict(open_span, end=1, error=None)]),
+            dict(head, spans=[dict(open_span, end=1, error=0)]),
+        )
+        self.assertEqual(len(d["spans"]["changed"]), 1)
+
+    def test_ordering_added_removed_follow_snapshots_changed_follows_after(self):
+        b = Telemetry(iter(range(100)).__next__)
+        b.inc("n", service="s2")
+        b.inc("n", service="s1")
+        b.start("x", service="s2")
+        b.start("x", service="s1")
+        a_empty = Telemetry().snapshot()
+        d = Telemetry.diff_snapshots(a_empty, b.snapshot())
+        # added 沿用 after 快照排序：计数器与跨度都以 service 为首键
+        self.assertEqual(
+            [c["service"] for c in d["counters"]["added"]], ["s1", "s2"]
+        )
+        self.assertEqual(
+            [x["service"] for x in d["spans"]["added"]], ["s1", "s2"]
+        )
+        # 同服务内跨度再按开始时间排序
+        b2 = Telemetry(iter(range(100)).__next__)
+        b2.start("late", service="s")   # start 0
+        b2.start("early", service="s")  # start 1
+        d_time = Telemetry.diff_snapshots(
+            Telemetry().snapshot(), b2.snapshot()
+        )
+        self.assertEqual(
+            [x["span"] for x in d_time["spans"]["added"]], ["late", "early"]
+        )
+        # removed 沿用 before 快照排序
+        d2 = Telemetry.diff_snapshots(b.snapshot(), a_empty)
+        self.assertEqual(
+            [c["service"] for c in d2["counters"]["removed"]], ["s1", "s2"]
+        )
+        # changed 按 after 的快照排序
+        before = {"counters": [
+            {"service": "s2", "name": "n", "labels": [], "value": 1},
+            {"service": "s1", "name": "n", "labels": [], "value": 1},
+        ], "samples": [], "spans": []}
+        after = {"counters": [
+            {"service": "s2", "name": "n", "labels": [], "value": 2},
+            {"service": "s1", "name": "n", "labels": [], "value": 2},
+        ], "samples": [], "spans": []}
+        d3 = Telemetry.diff_snapshots(before, after)
+        self.assertEqual(
+            [c["after"]["service"] for c in d3["counters"]["changed"]],
+            ["s1", "s2"],
+        )
+
+    def test_invalid_inputs_raise_valueerror_without_partial_results(self):
+        good = self.build_before().snapshot()
+        bad_payloads = [
+            "{not json}",
+            b"\xff not utf-8",
+            42,
+            None,
+            [1, 2],
+            {"counters": [], "samples": []},                    # 缺 spans
+            dict(good, extra=[]),                               # 多余顶层键
+            '{"counters":[],"counters":[],"samples":[],"spans":[]}',
+            {"counters": [{"service": "", "name": "c",
+                           "labels": [["k", float("nan")]], "value": 1}],
+             "samples": [], "spans": []},
+            {"counters": [], "samples": [], "spans": [
+                {"span": ["unhashable"], "service": "", "parent": None,
+                 "start": 0, "end": None, "error": None}]},
+            {"counters": [
+                {"service": "", "name": "c", "labels": [], "value": 1},
+                {"service": "", "name": "c", "labels": [], "value": 2},
+            ], "samples": [], "spans": []},
+        ]
+        for bad in bad_payloads:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                Telemetry.diff_snapshots(bad, good)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                Telemetry.diff_snapshots(good, bad)
+
+    def test_readonly_does_not_touch_inputs_clock_or_network(self):
+        before = self.build_before()
+        after = self.build_after()
+        before_snap = copy.deepcopy(before.snapshot())
+        after_snap = copy.deepcopy(after.snapshot())
+
+        class AssertingClock:
+            reads = 0
+
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("clock must not be read by diff")
+
+        before.clock = AssertingClock()
+        after.clock = AssertingClock()
+        d1 = Telemetry.diff_snapshots(before_snap, after_snap)
+        d2 = Telemetry.diff_snapshots(before.json(), after.json())
+        self.assertEqual(AssertingClock.reads, 0)
+        # 输入快照与实例状态均不变
+        self.assertEqual(before_snap, before.snapshot())
+        self.assertEqual(after_snap, after.snapshot())
+        self.assertEqual(before.snapshot(), self.build_before().snapshot())
+        json.dumps(d1, allow_nan=False)  # 结果严格可 JSON 序列化
+        json.dumps(d2, allow_nan=False)
+
+    def test_result_is_independent_from_inputs(self):
+        before = self.build_before().snapshot()
+        after = self.build_after().snapshot()
+        before_copy = copy.deepcopy(before)
+        after_copy = copy.deepcopy(after)
+        d = Telemetry.diff_snapshots(before, after)
+        # 改写结果中的记录与嵌套标签不影响输入，也不影响再次 diff
+        d["counters"]["changed"][0]["before"]["value"] = 999
+        d["counters"]["added"][0]["labels"].append(("zzz", 0))
+        d["samples"]["changed"][0]["after"]["values"].append(999)
+        d["spans"]["changed"][0]["after"]["parent"] = "mutated"
+        d["spans"]["added"] = []
+        self.assertEqual(before, before_copy)
+        self.assertEqual(after, after_copy)
+        again = Telemetry.diff_snapshots(before_copy, after_copy)
+        self.assertEqual(len(again["spans"]["added"]), 1)
+        self.assertEqual(
+            again["counters"]["changed"][0]["before"]["value"], 2
+        )
+        # before/after 两份记录彼此独立
+        pair = again["counters"]["changed"][0]
+        self.assertIsNot(pair["before"], pair["after"])
+        pair["before"]["name"] = "x"
+        self.assertNotEqual(pair["after"]["name"], "x")
+
+
 if __name__ == "__main__":
     unittest.main()
