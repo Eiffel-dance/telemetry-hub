@@ -485,38 +485,106 @@ class Telemetry:
             "mean": total / count,
         }
 
-    def snapshot(self):
+    @staticmethod
+    def _filter_service(service):
+        # snapshot/json 的服务筛选：缺省（None）匹配全部服务；提供时只能是
+        # 字符串，空字符串表示默认服务（与写入入口 _service 不同，那里显式
+        # 空串非法，这里空串是合法的筛选值）；其他类型一律 ValueError。
+        if service is not None and not isinstance(service, str):
+            raise ValueError("service filter must be a string when provided")
+        return service
+
+    @staticmethod
+    def _filter_status(status):
+        # 跨度状态筛选：缺省（None）保留所有服务的跨度；提供时只接受
+        # query 的同一组状态，拒绝规则也保持一致，非法值在读取聚合前抛出。
+        if status is not None and status not in ("open", "error", "closed"):
+            raise ValueError("status must be 'open', 'error' or 'closed'")
+        return status
+
+    @staticmethod
+    def _span_matches_status(entry, status):
+        # 沿用 query 对结束与异常的既有定义：open 看 end 为空；closed 看
+        # end 已写入（成功与带异常结束都包含）；error 要求已结束且
+        # error 不为 None（0、False、空容器等假值也不例外）。
+        if status is None:
+            return True
+        if status == "open":
+            return entry["end"] is None
+        if status == "closed":
+            return entry["end"] is not None
+        return entry["end"] is not None and entry["error"] is not None
+
+    def snapshot(self, service=None, labels=None, status=None):
+        """导出稳定排序的只读快照，支持可选的离线诊断筛选。
+
+        三个筛选全部可省略，省略时与无参数调用逐项一致，仍返回 counters、
+        samples、spans 三个数组。service 缺省匹配全部服务，提供时必须是字符
+        串，空字符串表示默认服务；labels 缺省匹配全部标签，提供时沿用 observe
+        的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合
+        与计数器/样本精确匹配（显式传空序列只命中无标签记录）；status 缺省
+        保留所有服务的跨度，提供时只能是 open/closed/error，判定与 query 完全
+        相同。service 对三个数组同时生效，status 只作用于跨度，父标识不随筛选
+        改写。任一筛选非法都在读取聚合前抛 ValueError：不调用 clock、不产生
+        部分结果；无匹配时对应数组为空。统计只对命中的样本序列按原规则重算，
+        排序仍按服务、名称、标签或跨度开始时间、标识的稳定顺序。返回的字典、
+        数组与记录均为独立副本，重复使用同一组筛选结果相同，筛选不写入、清空
+        或重排任何内部数据。
+        """
+        # 全部筛选先校验、归一化，之后才读取聚合，保证非法筛选不产生部分
+        # 结果；整个过程纯只读，不调用 clock。
+        service = self._filter_service(service)
+        status = self._filter_status(status)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+
         counters = []
-        for (service, name, labels), value in sorted(
+        for (svc, name, key_labels), value in sorted(
             self.counters.items(),
             key=lambda item: _OrderableTuple(item[0]),
         ):
+            if service is not None and svc != service:
+                continue
+            if labels is not None and key_labels != labels:
+                continue
             counters.append({
-                "service": service,
+                "service": svc,
                 "name": name,
-                "labels": list(labels),
+                "labels": list(key_labels),
                 "value": value,
             })
 
         samples = []
-        for (service, name, labels), values in sorted(
+        for (svc, name, key_labels), values in sorted(
             self.samples.items(),
             key=lambda item: _OrderableTuple(item[0]),
         ):
+            if service is not None and svc != service:
+                continue
+            if labels is not None and key_labels != labels:
+                continue
             entry = {
-                "service": service,
+                "service": svc,
                 "name": name,
-                "labels": list(labels),
+                "labels": list(key_labels),
                 "values": list(values),
             }
-            if values:  # 空样本不产生统计
+            if values:  # 空样本不产生统计；统计只对命中序列按原规则重算
                 entry.update(self._sample_stats(values))
             samples.append(entry)
+
+        spans = []
+        for entry in self._span_entries():
+            if service is not None and entry["service"] != service:
+                continue
+            if not self._span_matches_status(entry, status):
+                continue
+            spans.append(entry)
 
         return {
             "counters": counters,
             "samples": samples,
-            "spans": self._span_entries(),
+            "spans": spans,
         }
 
     @staticmethod
@@ -544,8 +612,13 @@ class Telemetry:
             message = ""
         return {"type": type_name, "message": message}
 
-    def json(self):
-        snapshot = self.snapshot()
+    def json(self, service=None, labels=None, status=None):
+        # 筛选原样透传给 snapshot：非法筛选在 snapshot 的读取聚合前统一抛
+        # ValueError，这里不产生部分序列化结果。可 JSON 表示的字段与同条件
+        # snapshot 完全一致，error 仍按既有规则转换，紧凑表示与稳定键序不变。
+        snapshot = self.snapshot(
+            service=service, labels=labels, status=status
+        )
         # 只改写本次序列化所用的副本：snapshot() 每次新建字典，跨度条目
         # 需要替换 error 时再复制一份，绝不回写 self.spans / query 结果。
         safe_spans = []

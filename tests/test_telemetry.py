@@ -764,5 +764,252 @@ class TelemetryBatchTest(unittest.TestCase):
         self.assertEqual(other.snapshot(), t.snapshot())
 
 
+class TelemetrySnapshotFilterTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("hits")
+        t.inc("hits", 2, labels=(("b", 2), ("a", 1)))
+        t.inc("hits", service="api")
+        t.inc("hits", 5, labels=(("k", "v"),), service="api")
+        t.observe("lat", 1)
+        t.observe("lat", 3, service="api")
+        t.observe("lat", 2, labels=(("k", "v"),), service="api")
+        t.start("s1")
+        t.finish("s1", error="boom")                 # 默认服务 closed+error
+        t.start("s2", service="api")                 # api open
+        t.start("s3", service="api", parent="s2")
+        t.finish("s3", service="api")                # api closed 成功
+        t.start("s4", parent="s1")
+        t.finish("s4", error=0)                      # error=0 也算异常
+        return t
+
+    def test_omitted_filters_identical_to_no_args(self):
+        t = self.build()
+        base = t.snapshot()
+        self.assertEqual(t.snapshot(None, None, None), base)
+        self.assertEqual(t.snapshot(service=None, labels=None, status=None), base)
+        self.assertEqual(t.json(None, None, None), t.json())
+        self.assertEqual(set(base), {"counters", "samples", "spans"})
+        # 字段集合仍是既有字段
+        for record in base["counters"]:
+            self.assertEqual(set(record), {"service", "name", "labels", "value"})
+        for record in base["samples"]:
+            self.assertTrue(
+                {"service", "name", "labels", "values"} <= set(record)
+            )
+        for record in base["spans"]:
+            self.assertEqual(
+                set(record),
+                {"span", "service", "parent", "start", "end", "error"},
+            )
+
+    def test_service_filter_applies_to_all_arrays(self):
+        t = self.build()
+        api = t.snapshot(service="api")
+        self.assertEqual({c["service"] for c in api["counters"]}, {"api"})
+        self.assertEqual({s["service"] for s in api["samples"]}, {"api"})
+        self.assertEqual({x["service"] for x in api["spans"]}, {"api"})
+        self.assertEqual(
+            [(c["name"], c["value"]) for c in api["counters"]],
+            [("hits", 1), ("hits", 5)],
+        )
+        self.assertEqual(
+            [x["span"] for x in api["spans"]], ["s2", "s3"]
+        )
+        # 空字符串表示默认服务
+        dflt = t.snapshot(service="")
+        self.assertEqual({c["service"] for c in dflt["counters"]}, {""})
+        self.assertEqual([x["span"] for x in dflt["spans"]], ["s1", "s4"])
+
+    def test_labels_exact_normalized_match_for_counters_and_samples(self):
+        t = self.build()
+        lab = t.snapshot(labels=(("a", 1), ("b", 2)))
+        self.assertEqual(
+            [(c["service"], c["value"]) for c in lab["counters"]], [("", 2)]
+        )
+        self.assertEqual(lab["counters"][0]["labels"], [("a", 1), ("b", 2)])
+        self.assertEqual(lab["samples"], [])
+        # 输入顺序不同、归一化后相同 -> 精确命中同一集合
+        self.assertEqual(t.snapshot(labels=(("b", 2), ("a", 1))), lab)
+        # 标签筛选不限制跨度
+        self.assertEqual(
+            t.snapshot(labels=(("a", 1), ("b", 2)))["spans"],
+            t.snapshot()["spans"],
+        )
+        # 显式空标签只命中无标签记录
+        no_lab = t.snapshot(labels=())
+        self.assertTrue(all(c["labels"] == [] for c in no_lab["counters"]))
+        self.assertEqual(
+            {(c["service"], c["value"]) for c in no_lab["counters"]},
+            {("", 1), ("api", 1)},
+        )
+        # 样本同样按完整标签集合匹配
+        hit = t.snapshot(service="api", labels=(("k", "v"),))
+        self.assertEqual(hit["samples"][0]["values"], [2])
+        # 子集不算命中
+        t2 = Telemetry()
+        t2.inc("n", labels=(("a", 1), ("b", 2)))
+        self.assertEqual(t2.snapshot(labels=(("a", 1),))["counters"], [])
+
+    def test_status_matches_query_definitions_and_order(self):
+        t = self.build()
+        for status in ("open", "closed", "error"):
+            self.assertEqual(
+                t.snapshot(status=status)["spans"], t.query(status)
+            )
+        self.assertEqual(
+            [x["span"] for x in t.snapshot(status="closed")["spans"]],
+            ["s1", "s4", "s3"],
+        )
+        # status 只作用于跨度，计数器/样本不受影响
+        base = t.snapshot()
+        self.assertEqual(t.snapshot(status="open")["counters"], base["counters"])
+        self.assertEqual(t.snapshot(status="error")["samples"], base["samples"])
+
+    def test_service_and_status_combine_parent_unchanged(self):
+        t = self.build()
+        self.assertEqual(
+            [x["span"] for x in t.snapshot(service="api", status="open")["spans"]],
+            ["s2"],
+        )
+        closed = t.snapshot(service="api", status="closed")["spans"]
+        self.assertEqual([x["span"] for x in closed], ["s3"])
+        self.assertEqual(closed[0]["parent"], "s2")  # 父标识不被筛选改写
+        self.assertEqual(
+            t.snapshot(service="api", status="error")["spans"], []
+        )
+
+    def test_stats_recomputed_per_matching_series(self):
+        t = Telemetry()
+        t.observe("m", 1, service="a")
+        t.observe("m", 3, service="a")
+        t.observe("m", 100, service="b")
+        entry = t.snapshot(service="a")["samples"][0]
+        self.assertEqual(entry["count"], 2)
+        self.assertEqual(entry["sum"], 4.0)
+        self.assertEqual(entry["mean"], 2.0)
+        self.assertEqual(entry["minimum"], 1.0)
+        self.assertEqual(entry["maximum"], 3.0)
+        # 空样本序列命中时仍不产生统计
+        t.samples[("", "empty", ())] = []
+        empty = t.snapshot(service="")["samples"]
+        self.assertTrue(
+            all(set(x) == {"service", "name", "labels", "values"} for x in empty)
+        )
+
+    def test_no_match_means_empty_arrays(self):
+        t = self.build()
+        self.assertEqual(
+            t.snapshot(service="nope"),
+            {"counters": [], "samples": [], "spans": []},
+        )
+        self.assertEqual(t.snapshot(labels=(("z", 1),))["counters"], [])
+        self.assertEqual(t.snapshot(labels=(("z", 1),))["samples"], [])
+        self.assertEqual(
+            t.snapshot(service="api", status="error")["spans"], []
+        )
+
+    def test_invalid_filters_raise_before_reading_and_without_clock(self):
+        t = self.build()
+        before = t.snapshot()
+
+        class AssertingClock:
+            reads = 0
+
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("clock must not be read by snapshot/json")
+
+        t.clock = AssertingClock()
+        cases = [
+            {"service": 1},
+            {"service": b"api"},
+            {"service": ["api"]},
+            {"service": True},
+            {"labels": (("k", 1), ("k", 2))},
+            {"labels": (("v", object()),)},
+            {"labels": (("v", float("nan")),)},
+            {"labels": 42},
+            {"status": ""},
+            {"status": "CLOSED"},
+            {"status": "done"},
+            {"status": 0},
+            {"service": 1, "status": "open"},
+            {"labels": (("k", 1),), "status": "bad"},
+        ]
+        for kwargs in cases:
+            with self.assertRaises(ValueError, msg=repr(kwargs)):
+                t.snapshot(**kwargs)
+            with self.assertRaises(ValueError, msg=repr(kwargs)):
+                t.json(**kwargs)
+        self.assertEqual(AssertingClock.reads, 0)
+        t.clock = iter(range(100)).__next__
+        self.assertEqual(t.snapshot(), before)  # 无部分结果、内部数据未变
+
+    def test_results_independent_and_repeatable(self):
+        t = self.build()
+        before = t.snapshot()
+        first = t.snapshot(service="api", labels=(), status="closed")
+        second = t.snapshot(service="api", labels=(), status="closed")
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        first["counters"].append("x")
+        first["samples"] = []
+        first["spans"][0]["span"] = "mutated"
+        self.assertEqual(
+            t.snapshot(service="api", labels=(), status="closed"), second
+        )
+        # 无筛选结果同样独立：改写返回对象不影响聚合器
+        snap = t.snapshot()
+        snap["counters"][0]["labels"].append(("zzz", 0))
+        snap["samples"][0]["values"].append(999)
+        snap["spans"][0]["error"] = "changed"
+        self.assertEqual(t.snapshot(), before)
+        # 标签输入对象不被修改或共享
+        labels = [("b", 2), ("a", 1)]
+        result = t.snapshot(labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+        labels.append(("c", 3))
+        self.assertEqual(t.snapshot(labels=[("b", 2), ("a", 1)]), result)
+        # 内部存储顺序不被筛选改变
+        self.assertEqual(t.snapshot(), before)
+
+    def test_json_filter_matches_snapshot_compact_and_error_rule(self):
+        t = self.build()
+        for kwargs in (
+            {},
+            {"service": "api"},
+            {"labels": ()},
+            {"status": "closed"},
+            {"service": "api", "labels": (("k", "v"),), "status": "open"},
+        ):
+            self.assertEqual(
+                t.json(**kwargs),
+                json.dumps(
+                    t.snapshot(**kwargs),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        text = t.json(service="api")
+        self.assertNotIn(": ", text)
+        self.assertNotIn(", ", text)
+
+        t2 = Telemetry(iter(range(10)).__next__)
+        t2.start("e")
+        t2.finish("e", error=ValueError("x"))
+        t2.start("ok")
+        t2.finish("ok")
+        t2.start("o")
+        self.assertEqual(
+            json.loads(t2.json(status="error"))["spans"][0]["error"],
+            {"type": "ValueError", "message": "x"},
+        )
+        self.assertIsNone(json.loads(t2.json())["spans"][1]["error"])
+        self.assertEqual(
+            json.loads(t2.json(status="open"))["spans"][0]["span"], "o"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
