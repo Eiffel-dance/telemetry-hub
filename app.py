@@ -429,6 +429,48 @@ class Telemetry:
         return build(span, record)
 
     @staticmethod
+    def _check_percentile_q(q):
+        # 只接受非 bool 的 int/float：bool 是 int 的子类，必须显式排除；
+        # 其他数值类型（Decimal、Fraction、字符串等）一律拒绝。
+        if isinstance(q, bool) or not isinstance(q, (int, float)):
+            raise ValueError("q must be an int or float, got %r" % (q,))
+        if not math.isfinite(q):
+            raise ValueError("q must be finite, got %r" % (q,))
+        if q < 0 or q > 100:
+            raise ValueError("q must be within [0, 100], got %r" % (q,))
+        return q
+
+    def percentile(self, name, q, labels=(), service=None):
+        """离线诊断：对一条已记录的样本序列计算分位数，只读不改状态。
+
+        service 与 labels 的归一化规则与 observe 完全一致（service 缺省为
+        默认服务，显式传入必须是非空字符串；标签按键排序、拒绝重复键与
+        不可序列化值），name 必须可哈希才能作为样本键。q 只接受非 bool 的
+        int/float，必须有限且落在 [0, 100] 闭区间，否则统一抛 ValueError。
+        任何拒绝都发生在读取样本之前：不读 clock、不改变计数器、样本、
+        跨度或输入对象，也不产生部分结果。样本键不存在或序列为空返回
+        None；命中时按公开浮点规则把每个值转换为数值并升序排序（排序
+        副本不回写 values），以位置 (n-1)*q/100 线性插值，位置为整数时
+        直接取该项，q=0/100 分别得到最小值/最大值，返回 Python float。
+        只读取当前聚合，重复调用结果相同。
+        """
+        service = self._service(service)
+        labels = self._normalize_labels(labels)
+        self._restore_hashable(name, "name")
+        q = self._check_percentile_q(q)
+        values = self.samples.get((service, name, labels))
+        if not values:  # 键不存在或空序列：无分位数可言
+            return None
+        ordered = sorted(float(value) for value in values)
+        position = (len(ordered) - 1) * q / 100.0
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:  # 整数位置（含 q=0 与 q=100）：直接取该项
+            return float(ordered[lower])
+        fraction = position - lower
+        return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
+
+    @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
         total = 0.0
