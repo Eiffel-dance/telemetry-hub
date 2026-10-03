@@ -84,13 +84,16 @@ class Telemetry:
             raise ValueError("invalid labels: %s" % (exc,))
         return tuple(pairs)
 
-    def inc(self, name, value=1, labels=(), service=None):
+    # 四个 _apply_* 助手把公开入口的写入逻辑参数化到任意状态字典与
+    # clock 上：单条调用传自身聚合与真实 clock，batch 先在副本上用它
+    # 试算，语义因此保持一致。
+    def _apply_inc(self, counters, name, value, labels, service):
         service = self._service(service)
         labels = self._normalize_labels(labels)
         key = (service, name, labels)
-        self.counters[key] = self.counters.get(key, 0) + value
+        counters[key] = counters.get(key, 0) + value
 
-    def observe(self, name, value, labels=(), service=None):
+    def _apply_observe(self, samples, name, value, labels, service):
         service = self._service(service)
         labels = self._normalize_labels(labels)
         try:
@@ -100,9 +103,9 @@ class Telemetry:
         if math.isnan(numeric) or math.isinf(numeric):
             raise ValueError("sample value must be finite, got %r" % (value,))
         key = (service, name, labels)
-        self.samples.setdefault(key, []).append(value)
+        samples.setdefault(key, []).append(value)
 
-    def start(self, span, parent=None, service=None):
+    def _apply_start(self, spans, clock, span, parent, service):
         # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
         # 空字符串，显式传入必须是非空字符串；span 必须可哈希。任一校验
         # 失败都不推进 clock、不留下半条记录。
@@ -112,22 +115,22 @@ class Telemetry:
         # 跨度由 service 与 span 共同唯一标识：无论同标识跨度仍未结束还是
         # 已经结束，重复开始一律拒绝，原有 parent/start/end/error 不被覆盖，
         # clock 也不被推进。
-        if key in self.spans:
+        if key in spans:
             raise ValueError(
                 "span already exists for service=%r span=%r" % (service, span)
             )
-        self.spans[key] = {
+        spans[key] = {
             "parent": parent,
-            "start": self.clock(),
+            "start": clock(),
             "end": None,
             "error": None,
         }
 
-    def finish(self, span, error=None, service=None):
+    def _apply_finish(self, spans, clock, span, error, service):
         # 与 start 相同的入站校验顺序；被拒绝的调用不读取或生成时间戳。
         service = self._service(service)
         self._restore_hashable(span, "span")
-        record = self.spans.get((service, span))
+        record = spans.get((service, span))
         if record is None:
             raise ValueError(
                 "span not found for service=%r span=%r" % (service, span)
@@ -136,8 +139,122 @@ class Telemetry:
             raise ValueError(
                 "span already finished for service=%r span=%r" % (service, span)
             )
-        record["end"] = self.clock()
+        record["end"] = clock()
         record["error"] = error
+
+    def inc(self, name, value=1, labels=(), service=None):
+        self._apply_inc(self.counters, name, value, labels, service)
+
+    def observe(self, name, value, labels=(), service=None):
+        self._apply_observe(self.samples, name, value, labels, service)
+
+    def start(self, span, parent=None, service=None):
+        self._apply_start(self.spans, self.clock, span, parent, service)
+
+    def finish(self, span, error=None, service=None):
+        self._apply_finish(self.spans, self.clock, span, error, service)
+
+    # ------------------------------------------------------------------
+    # 离线批量回放
+    # ------------------------------------------------------------------
+
+    # 每种 op 允许的事件字段（op 本身除外）：必需字段 + 可选字段，
+    # 可选字段缺省时沿用对应公开入口的默认值。
+    _BATCH_FIELDS = {
+        "inc": (("name",), {"value": 1, "labels": (), "service": None}),
+        "observe": (("name", "value"), {"labels": (), "service": None}),
+        "start": (("span",), {"parent": None, "service": None}),
+        "finish": (("span",), {"error": None, "service": None}),
+    }
+
+    def _batch_plan(self, events):
+        # 结构校验：只检查事件形状与字段，不触碰聚合状态，也不读取 clock。
+        if not isinstance(events, (list, tuple)):
+            raise ValueError("events must be a list or tuple of event objects")
+        plans = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise ValueError("event must be an object")
+            op = event.get("op")
+            if not isinstance(op, str) or op not in self._BATCH_FIELDS:
+                raise ValueError("event op must be one of inc/observe/start/finish")
+            required, defaults = self._BATCH_FIELDS[op]
+            allowed = {"op",} | set(required) | set(defaults)
+            unknown = set(event) - allowed
+            if unknown:
+                raise ValueError(
+                    "unexpected fields for op %r: %r"
+                    % (op, sorted(unknown, key=repr))
+                )
+            missing = [field for field in required if field not in event]
+            if missing:
+                raise ValueError(
+                    "missing required fields for op %r: %r" % (op, missing)
+                )
+            kwargs = dict(defaults)
+            for field in required:
+                kwargs[field] = event[field]
+            for field in defaults:
+                if field in event:
+                    kwargs[field] = event[field]
+            plans.append((op, kwargs))
+        return plans
+
+    def _batch_run(self, plans, counters, samples, spans, clock):
+        # 在给定状态上按计划顺序应用事件；clock 由调用方决定
+        # （试算阶段为不读取真实 clock 的占位，提交阶段为 self.clock）。
+        for op, kwargs in plans:
+            if op == "inc":
+                self._apply_inc(counters, **kwargs)
+            elif op == "observe":
+                self._apply_observe(samples, **kwargs)
+            elif op == "start":
+                self._apply_start(spans, clock, **kwargs)
+            else:
+                self._apply_finish(spans, clock, **kwargs)
+
+    def _batch_scratch(self):
+        # 逐键/逐条浅拷贝：应用过程只会整体替换计数器值、向样本列表追加、
+        # 改写跨度记录的 end/error 字段，绝不原地修改已有值对象。
+        return (
+            dict(self.counters),
+            {key: list(values) for key, values in self.samples.items()},
+            {key: dict(record) for key, record in self.spans.items()},
+        )
+
+    def batch(self, events):
+        """按输入顺序批量回放离线诊断事件，成功返回 None。
+
+        events 只能是事件对象组成的列表或元组；每个事件用 op 指定
+        inc/observe/start/finish，其余字段沿用对应公开入口的名称、默认值
+        与校验规则。批次内后续事件可以使用前面事件刚建立的跨度；成功后
+        snapshot/json/query/trace 与按同一顺序逐条调用完全一致，start 和
+        finish 仍各自只读取一次 clock。空批次视为成功且不改变状态。
+
+        先结构校验，再在状态副本上完整试算（不读取 clock），最后一次性
+        提交：事件不是对象、op 缺失或未知、字段不属于所选操作、缺失必需
+        值、值违反服务/标签/样本/跨度规则、重复开始、结束不存在或已结束
+        的跨度，一律抛 ValueError，且计数器、样本、跨度与 clock 读取次数
+        都保持调用前状态；提交阶段 clock 自身抛出的异常原样传播，状态同样
+        恢复。传入的事件对象及其标签、值不被改写。
+        """
+        plans = self._batch_plan(events)
+        if not plans:  # 空批次：成功且不改变状态
+            return None
+
+        # 试算阶段：完整执行除真实 clock 之外的全部校验与聚合，任何
+        # ValueError 都在读取 clock 之前抛出，自身状态不被触碰。
+        counters, samples, spans = self._batch_scratch()
+        self._batch_run(plans, counters, samples, spans, lambda: None)
+
+        # 提交阶段：试算已通过，此处唯一可能失败的是 clock 自身；在新副本
+        # 上重放并按事件顺序读取 clock，全部成功才一次性写回 self。
+        counters, samples, spans = self._batch_scratch()
+        self._batch_run(plans, counters, samples, spans, self.clock)
+        self.counters = counters
+        self.samples = samples
+        self.spans = spans
+        return None
 
     @staticmethod
     def _span_entry(service, span, record):
