@@ -96,8 +96,20 @@ class TelemetryBehaviorTest(unittest.TestCase):
 
         opened = t.query("open")
         errored = t.query("error")
+        closed = t.query("closed")
         self.assertEqual([(e["service"], e["span"]) for e in opened], [("api", "r1")])
         self.assertEqual([(e["service"], e["span"]) for e in errored], [("", "r1")])
+        # closed 同时包含成功结束与带异常结束的跨度，不含未结束跨度
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in closed],
+            [("", "r1"), ("api", "r2")],
+        )
+        self.assertEqual(
+            set(closed[0]),
+            {"span", "service", "parent", "start", "end", "error"},
+        )
+        self.assertIsNone(closed[1]["error"])
+        self.assertIsNotNone(closed[1]["end"])
         self.assertEqual(
             set(errored[0]),
             {"span", "service", "parent", "start", "end", "error"},
@@ -105,9 +117,61 @@ class TelemetryBehaviorTest(unittest.TestCase):
         self.assertIsNone(errored[0]["parent"])
         self.assertEqual(errored[0]["error"], "boom")
         self.assertIsNotNone(errored[0]["end"])
-        with self.assertRaises(ValueError):
-            t.query("closed")
+        for bad in ("CLOSED", "", None, 1, b"open", ["open"], ("open",)):
+            with self.assertRaises(ValueError):
+                t.query(bad)
         self.assertEqual(t.query("error"), t.query("error"))
+        self.assertEqual(t.query("closed"), t.query("closed"))
+
+    def test_query_closed_empty_and_ordering(self):
+        t = Telemetry(iter(range(100)).__next__)
+        self.assertEqual(t.query("closed"), [])  # 没有已结束跨度时为空列表
+        # 不同服务交错创建、start 相同：仍按服务、开始时间、标识排序
+        clock_calls = iter([0] * 10).__next__
+        t.clock = clock_calls
+        t.start("b", service="api")
+        t.start("a")
+        t.start("c", service="api")
+        t.finish("c", service="api")
+        t.finish("b", service="api", error="boom")
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("closed")],
+            [("api", "b"), ("api", "c")],
+        )
+        # open 与 error 状态结果不受 closed 新增影响
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("open")],
+            [("", "a")],
+        )
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("error")],
+            [("api", "b")],
+        )
+
+    def test_query_result_is_independent(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("hits")
+        t.observe("lat", 1.0)
+        t.start("s")
+        t.finish("s", error="boom")
+        before = t.snapshot()
+        closed = t.query("closed")
+        closed[0]["span"] = "mutated"
+        closed[0]["end"] = None
+        closed.append({"span": "extra"})
+        self.assertEqual(t.snapshot(), before)  # 修改结果不影响聚合器
+        again = t.query("closed")
+        self.assertEqual(again[0]["span"], "s")
+        self.assertIsNotNone(again[0]["end"])
+        self.assertEqual(len(again), 1)
+
+    def test_query_closed_keeps_error_object(self):
+        t = Telemetry(iter(range(100)).__next__)
+        exc = ValueError("x")
+        t.start("s")
+        t.finish("s", error=exc)
+        closed = t.query("closed")
+        self.assertIs(closed[0]["error"], exc)  # 异常对象保留原值
 
     def test_span_service_locator_and_parent(self):
         t = Telemetry(iter(range(100)).__next__)
@@ -174,6 +238,7 @@ class TelemetryRestoreTest(unittest.TestCase):
         self.assertEqual(restored.json(), t.json())
         self.assertEqual(restored.query("open"), t.query("open"))
         self.assertEqual(restored.query("error"), t.query("error"))
+        self.assertEqual(restored.query("closed"), t.query("closed"))
 
     def test_roundtrip_via_json_text(self):
         t = self.build()

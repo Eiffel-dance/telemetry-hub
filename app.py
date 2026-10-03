@@ -141,13 +141,18 @@ class Telemetry:
         return entries
 
     def query(self, status):
-        # open：end 仍为空；error：已结束且 error 非空。其他状态一律 ValueError。
-        if status not in ("open", "error"):
-            raise ValueError("status must be 'open' or 'error'")
+        # open：end 仍为空；error：已结束且 error 非空（真值规则）；
+        # closed：end 已写入，成功结束与带异常结束都算。其他状态一律
+        # ValueError，校验先于任何读取，不推进 clock、不留部分结果。
+        if status not in ("open", "error", "closed"):
+            raise ValueError("status must be 'open', 'error' or 'closed'")
         result = []
         for entry in self._span_entries():
             if status == "open":
                 if entry["end"] is None:
+                    result.append(entry)
+            elif status == "closed":
+                if entry["end"] is not None:
                     result.append(entry)
             elif entry["end"] is not None and entry["error"]:
                 result.append(entry)
