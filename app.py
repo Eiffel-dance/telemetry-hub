@@ -164,7 +164,9 @@ class Telemetry:
 
     def query(self, status):
         # open：end 仍为空；closed：end 已写入（成功结束与带异常结束都包含，
-        # 不再看 error 真值）；error：已结束且 error 非空。只接受这三个
+        # 不再看 error 真值）；error：已结束且 error 不为 None。任何非 None
+        # 的结束 error 都算异常——0、False、空字符串、空列表、空字典等假值
+        # 也不例外，只有 None（JSON 中为 null）表示正常结束。只接受这三个
         # 字符串，其他字符串、空值、非字符串一律 ValueError；拒绝发生在
         # 读取任何跨度之前，不调用 clock，也不产生部分结果。每条命中都通过
         # _span_entry 生成独立记录字典，调用方改写返回列表或记录字段不影响
@@ -179,7 +181,7 @@ class Telemetry:
             elif status == "closed":
                 if entry["end"] is not None:
                     result.append(entry)
-            elif entry["end"] is not None and entry["error"]:
+            elif entry["end"] is not None and entry["error"] is not None:
                 result.append(entry)
         return result
 
