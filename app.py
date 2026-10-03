@@ -25,6 +25,30 @@ class _Orderable:
         return repr(a) < repr(b)
 
 
+class _OrderableTuple:
+    """逐元素按 _Orderable 规则做字典序比较的排序键。
+
+    不能直接使用 (_Orderable(v), ...) 普通元组：元组比较先以相等性短路，
+    而 _Orderable 未定义值相等语义，包装同一相等值的两个不同实例会被
+    误判为不可区分，后续元素（start、span）的平局判定永远不会执行，
+    同服务同开始时间的跨度只能退回插入顺序。这里仅依赖每个元素自己的
+    __lt__，单元素比较语义与直接使用 _Orderable 完全一致。
+    """
+
+    __slots__ = ("parts",)
+
+    def __init__(self, values):
+        self.parts = tuple(_Orderable(value) for value in values)
+
+    def __lt__(self, other):
+        for left, right in zip(self.parts, other.parts):
+            if left < right:
+                return True
+            if right < left:
+                return False
+        return False
+
+
 class Telemetry:
     def __init__(self, clock=time.time):
         self.clock = clock
@@ -132,22 +156,28 @@ class Telemetry:
             for (service, span), record in self.spans.items()
         ]
         entries.sort(
-            key=lambda entry: (
-                _Orderable(entry["service"]),
-                _Orderable(entry["start"]),
-                _Orderable(entry["span"]),
+            key=lambda entry: _OrderableTuple(
+                (entry["service"], entry["start"], entry["span"])
             )
         )
         return entries
 
     def query(self, status):
-        # open：end 仍为空；error：已结束且 error 非空。其他状态一律 ValueError。
-        if status not in ("open", "error"):
-            raise ValueError("status must be 'open' or 'error'")
+        # open：end 仍为空；closed：end 已写入（成功结束与带异常结束都包含，
+        # 不再看 error 真值）；error：已结束且 error 非空。只接受这三个
+        # 字符串，其他字符串、空值、非字符串一律 ValueError；拒绝发生在
+        # 读取任何跨度之前，不调用 clock，也不产生部分结果。每条命中都通过
+        # _span_entry 生成独立记录字典，调用方改写返回列表或记录字段不影响
+        # counters/samples/spans；error 原值（含异常实例）原样保留。
+        if status not in ("open", "error", "closed"):
+            raise ValueError("status must be 'open', 'error' or 'closed'")
         result = []
         for entry in self._span_entries():
             if status == "open":
                 if entry["end"] is None:
+                    result.append(entry)
+            elif status == "closed":
+                if entry["end"] is not None:
                     result.append(entry)
             elif entry["end"] is not None and entry["error"]:
                 result.append(entry)
@@ -198,10 +228,8 @@ class Telemetry:
                 for child_span in children_by_parent.get(node_span, ())
             ]
             children.sort(
-                key=lambda item: (
-                    _Orderable(service),
-                    _Orderable(item[1]["start"]),
-                    _Orderable(item[0]),
+                key=lambda item: _OrderableTuple(
+                    (service, item[1]["start"], item[0])
                 )
             )
             for child_span, child_record in children:
@@ -229,7 +257,7 @@ class Telemetry:
         counters = []
         for (service, name, labels), value in sorted(
             self.counters.items(),
-            key=lambda item: tuple(_Orderable(x) for x in item[0]),
+            key=lambda item: _OrderableTuple(item[0]),
         ):
             counters.append({
                 "service": service,
@@ -241,7 +269,7 @@ class Telemetry:
         samples = []
         for (service, name, labels), values in sorted(
             self.samples.items(),
-            key=lambda item: tuple(_Orderable(x) for x in item[0]),
+            key=lambda item: _OrderableTuple(item[0]),
         ):
             entry = {
                 "service": service,

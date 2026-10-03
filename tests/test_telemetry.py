@@ -96,17 +96,26 @@ class TelemetryBehaviorTest(unittest.TestCase):
 
         opened = t.query("open")
         errored = t.query("error")
+        closed = t.query("closed")
         self.assertEqual([(e["service"], e["span"]) for e in opened], [("api", "r1")])
         self.assertEqual([(e["service"], e["span"]) for e in errored], [("", "r1")])
+        # closed：所有 end 已写入的跨度，成功结束与带异常结束都包含，
+        # 仍未结束的 api/r1 不出现；沿用 service、start、span 顺序。
         self.assertEqual(
-            set(errored[0]),
+            [(e["service"], e["span"]) for e in closed],
+            [("", "r1"), ("api", "r2")],
+        )
+        self.assertEqual(
+            set(closed[0]),
             {"span", "service", "parent", "start", "end", "error"},
         )
+        self.assertIsNone(closed[1]["error"])  # 成功结束的跨度同样属于 closed
         self.assertIsNone(errored[0]["parent"])
         self.assertEqual(errored[0]["error"], "boom")
         self.assertIsNotNone(errored[0]["end"])
-        with self.assertRaises(ValueError):
-            t.query("closed")
+        for bad in ("", "CLOSED", "done", None, 0, b"closed", ["closed"]):
+            with self.assertRaises(ValueError):
+                t.query(bad)
         self.assertEqual(t.query("error"), t.query("error"))
 
     def test_span_service_locator_and_parent(self):
