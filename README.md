@@ -17,7 +17,39 @@ Tests: python3 -m unittest discover -s tests -v
 - `query(status)`：仅接受 `'open'`（`end` 为空）、`'closed'`（`end` 已写入，成功结束与带异常结束都算）和 `'error'`（已结束且 `error` 非空），其他字符串、空值或非字符串值抛 `ValueError`（拒绝时不调用 clock、不留部分结果），无匹配返回 `[]`；结果含 `span/service/parent/start/end/error`，按服务、开始时间、标识排序；返回值为独立列表与独立记录，调用方修改不影响聚合器，`error` 原值（含异常对象）保留。
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
 - `snapshot()` / `json()`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。
+- `percentile(name, q, labels=(), service=None)`：只读的分位数查询，用于离线诊断样本分布，调用方无需先导出或修改聚合器状态。`service` 与 `labels` 按 `observe` 的规则归一化（`service` 缺省为默认服务，显式传入必须是非空字符串；标签按键字典序归一化，重复键或不可 JSON 序列化抛 `ValueError`），`name` 必须可哈希才能作为样本键。`q` 只接受非 `bool` 的 `int`/`float`，必须为有限值且落在 `[0, 100]` 闭区间，否则统一抛 `ValueError`；任何拒绝都发生在读取 clock 之前，不改变计数器、样本、跨度，也不修改传入的输入对象。命中样本键后把该序列每个值按 `observe` 的有限浮点规则转为 `float`，升序排序（排序副本不写回 `values`），以位置 `(n-1)*q/100` 线性插值：位置为整数时直接取该项，`q=0` 与 `q=100` 分别得到最小值与最大值，返回 Python `float`。样本键不存在或序列为空返回 `None`。本入口只读取当前聚合，重复调用结果相同，不新增 `snapshot()`/`json()` 字段。
 - `Telemetry.from_snapshot(payload, clock=time.time)`：离线把 `snapshot()` 字典或 `json()` 文本重建为独立实例，计数器、样本原值与跨度的 parent/start/end/error 全部带回，样本统计按公开浮点规则从 values 重算（输入中存在的统计字段须与重算一致，空 values 不得携带统计）。payload 顶层只能含 `counters`、`samples`、`spans` 三个数组；缺字段、多字段、非法 JSON、重复记录、无效标签、不可哈希跨度标识、不可严格 JSON 表示的值等一律抛 `ValueError`，且失败前不留下半成品实例、不改动已有实例。恢复过程不联网、不读写文件、不修改输入；恢复后与原对象互不共享数据，`open` 跨度可继续用 `finish()` 结束。
 - `merge_snapshot(payload)`：把一份离线分片快照原子合并进当前实例，返回 `None`；输入接受范围与 `from_snapshot` 相同（字典、JSON 文本、UTF-8 字节），校验规则也一致。计数器按服务、名称、归一化标签定位，相同键按加法语义累加，不可相加抛 `ValueError`；相同键样本先保留当前 `values` 再按输入顺序追加输入值，统计按公开浮点规则从完整 values 重算；跨度以 service 与 span 联合定位，仅一方出现时整体复制，两方完全一致时幂等，不一致时抛 `ValueError`。先完整解析校验、再一次性提交：任何恢复或合并错误都使当前实例的聚合、跨度与时钟配置保持不变，输入不被改写，合并后数据不与 payload 共享可变对象；不联网、不读写文件。
 - `batch(events)`：离线诊断数据的批量回放入口，按输入顺序一次提交，成功返回 `None`。`events` 只能是事件对象（dict）组成的列表或元组；每个事件以 `op` 指定 `inc`、`observe`、`start` 或 `finish`，其余字段沿用对应公开入口的名称（`name`/`value`/`labels`/`span`/`parent`/`error`/`service`）、默认值（`value=1`、`labels=()`、`parent=None`、`error=None`、`service=None`）与校验规则；批次内后续事件可以使用前面事件刚建立的跨度。空批次视为成功且不改变状态。成功提交后 `snapshot`/`json`/`query`/`trace` 的结果与按同一顺序直接调用对应入口完全一致，每个 `start`/`finish` 仍只读取一次 clock 且读取次序相同。事件不是对象、不是列表/元组、`op` 缺失或未知、字段不属于所选操作、缺失必需字段（`name`/`span`、observe 的 `value`），或事件值违反服务、标签、样本、跨度规则（含重复开始、结束不存在或已结束的跨度），统一抛 `ValueError`。提交具有原子可见性：任何事件被拒绝时计数器、样本、跨度、查询结果与后续快照保持调用前状态，且拒绝判定阶段不读取 clock；提交阶段 clock 自身抛出的异常原样向调用方传播并同样恢复调用前状态。批量入口不修改传入事件对象或其中的标签和值，也不新增快照字段。
+
+## percentile 示例
+
+```python
+t = Telemetry()
+
+# 单值样本：任何 q 都返回该值
+t.observe("lat", 5.0)
+t.percentile("lat", 50)    # 5.0
+t.percentile("lat", 0)     # 5.0（最小值）
+t.percentile("lat", 100)   # 5.0（最大值）
+
+# 偶数个样本：位置 (n-1)*q/100 线性插值
+t.observe("rt", 10.0, service="api")
+t.observe("rt", 20.0, service="api")
+t.observe("rt", 30.0, service="api")
+t.observe("rt", 40.0, service="api")
+t.percentile("rt", 50, service="api")   # 25.0（位置 1.5，20 与 30 的中点）
+t.percentile("rt", 0, service="api")    # 10.0（最小值）
+t.percentile("rt", 100, service="api")  # 40.0（最大值）
+
+# 样本键不存在（或序列为空）返回 None
+t.percentile("missing", 50)  # None
+
+# 非法 q 统一抛 ValueError，且不改变任何聚合
+t.percentile("lat", True)     # ValueError：bool 不是可接受的数值
+t.percentile("lat", -1)       # ValueError：超出 [0, 100]
+t.percentile("lat", 100.5)    # ValueError：超出 [0, 100]
+t.percentile("lat", "50")     # ValueError：非 int/float
+```
+
 

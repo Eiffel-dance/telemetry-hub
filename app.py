@@ -428,6 +428,41 @@ class Telemetry:
 
         return build(span, record)
 
+    def percentile(self, name, q, labels=(), service=None):
+        """离线诊断：对一条已记录的样本序列计算分位数（只读）。
+
+        service 与 labels 按 observe 的规则归一化（service 缺省为默认服务，
+        显式传入必须是非空字符串；标签按键字典序归一化，重复键或不可 JSON
+        序列化一律 ValueError），name 必须可哈希才能作为样本键。q 只接受
+        非 bool 的 int/float，必须有限且落在 [0, 100] 闭区间，否则统一抛
+        ValueError；任何拒绝都发生在读取 clock 之前，不改变计数器、样本、
+        跨度，也不修改传入的 labels 等输入对象。
+
+        命中样本键后把序列每个值按 observe 的有限浮点规则转为 float，
+        升序排序（排序副本不写回 values），以位置 (n-1)*q/100 线性插值：
+        位置为整数时直接取该项，q=0 与 q=100 分别得到最小值与最大值，
+        返回 Python float。样本键不存在或序列为空返回 None。本入口只读取
+        当前聚合，重复调用结果相同，不新增 snapshot()/json() 字段。
+        """
+        service = self._service(service)
+        labels = self._normalize_labels(labels)
+        self._restore_hashable(name, "name")
+        if isinstance(q, bool) or not isinstance(q, (int, float)):
+            raise ValueError("q must be an int or float between 0 and 100")
+        if math.isnan(q) or math.isinf(q) or q < 0 or q > 100:
+            raise ValueError("q must be a finite value between 0 and 100")
+        values = self.samples.get((service, name, labels))
+        if not values:  # 样本键不存在或序列为空
+            return None
+        ordered = sorted(float(value) for value in values)
+        position = (len(ordered) - 1) * (q / 100.0)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:  # 位置为整数（含 q=0 与 q=100）：直接取该项
+            return float(ordered[lower])
+        fraction = position - lower
+        return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
+
     @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
