@@ -107,6 +107,21 @@ def _thaw_labels(labels):
     return [(key, _thaw_json(value)) for key, value in labels]
 
 
+def _copy_input_value(value):
+    # start/finish 入站原值（parent/error）与只读结果之间的隔离：仅对可变
+    # 容器做深拷贝，标量与自定义对象原样保留。容器只可能由合法 JSON 值构成
+    # （恢复路径拒绝非严格 JSON 值），深拷贝不会失败；直接 start/finish 可能
+    # 收到不可复制的容器，此时回退为原值——读取侧按同一规则再复制，既不为
+    # 隔离新增拒绝条件，也绝不把半拷贝结构泄漏进返回结果。异常实例必须原样：
+    # 异常按身份比较，拷贝会破坏“重复读取结果相等”这一既有可观察行为。
+    if isinstance(value, (list, tuple, dict, set, frozenset)):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+    return value
+
+
 class SnapshotFormatError(ValueError):
     """快照恢复格式错误的公开异常类型。
 
@@ -197,14 +212,15 @@ class Telemetry:
     @staticmethod
     def _apply_start(spans, service, span, parent, timestamper):
         # 跨度创建的唯一实现点：重复校验先于时间戳读取，
-        # timestamper 每次创建只被调用一次。
+        # timestamper 每次创建只被调用一次。parent 中的可变容器在此复制，
+        # 调用方事后修改入参对象不会改写已记录跨度。
         key = (service, span)
         if key in spans:
             raise ValueError(
                 "span already exists for service=%r span=%r" % (service, span)
             )
         spans[key] = {
-            "parent": parent,
+            "parent": _copy_input_value(parent),
             "start": timestamper(),
             "end": None,
             "error": None,
@@ -213,7 +229,8 @@ class Telemetry:
     @staticmethod
     def _apply_finish(spans, service, span, error, timestamper):
         # 跨度结束的唯一实现点：不存在与已结束的校验先于时间戳读取，
-        # timestamper 每次结束只被调用一次。
+        # timestamper 每次结束只被调用一次。error 中的可变容器在此复制，
+        # 调用方事后修改入参对象不会改写已记录跨度。
         key = (service, span)
         record = spans.get(key)
         if record is None:
@@ -225,7 +242,7 @@ class Telemetry:
                 "span already finished for service=%r span=%r" % (service, span)
             )
         record["end"] = timestamper()
-        record["error"] = error
+        record["error"] = _copy_input_value(error)
 
     def start(self, span, parent=None, service=None):
         # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
@@ -404,13 +421,17 @@ class Telemetry:
 
     @staticmethod
     def _span_entry(service, span, record):
+        # 跨度记录的唯一构造点（query/snapshot/diff 共用）：记录字典本身是
+        # 新建对象，parent/error 再各取一份独立副本，使每条返回记录与内部
+        # 状态、同次其他记录之间都不共享可变容器；标量、异常实例与不可复制
+        # 对象按原值语义返回。
         return {
             "span": span,
             "service": service,
-            "parent": record["parent"],
+            "parent": _copy_input_value(record["parent"]),
             "start": record["start"],
             "end": record["end"],
-            "error": record["error"],
+            "error": _copy_input_value(record["error"]),
         }
 
     def _span_entries(self):
@@ -505,8 +526,10 @@ class Telemetry:
             if key in visited:  # 每个跨度只有一个父标识，重复到达即成环
                 raise ValueError("cycle detected in span parent references")
             visited.add(key)
+            # _span_entry 已使节点记录及其 parent/error 与内部状态隔离，
+            # children 为新建数组，无需再整体深拷贝（整体深拷贝反而会复制
+            # 异常实例等原值对象，破坏原值语义）。
             node = self._span_entry(service, node_span, node_record)
-            node = copy.deepcopy(node)  # 与聚合器切断一切可变对象共享
             node["children"] = []
             children = [
                 (child_span, self.spans[(service, child_span)])

@@ -1619,5 +1619,192 @@ class TelemetryRestoreResumeTest(unittest.TestCase):
         )
 
 
+class TelemetrySpanValueIsolationTest(unittest.TestCase):
+    # 只读结果中的 parent/error 必须与内部状态、入参对象以及同次其他记录隔离，
+    # 标量、异常实例与不可复制对象继续按原值语义返回。
+
+    @staticmethod
+    def _mutate(value):
+        # 在任意可变容器深处写入标记，不假定具体键名。
+        if isinstance(value, dict):
+            for nested in value.values():
+                if isinstance(nested, (dict, list, tuple)):
+                    TelemetrySpanValueIsolationTest._mutate(nested)
+            value["mut"] = 1
+        elif isinstance(value, list):
+            for nested in value:
+                if isinstance(nested, (dict, list, tuple)):
+                    TelemetrySpanValueIsolationTest._mutate(nested)
+            value.append("mut")
+        elif isinstance(value, tuple):
+            for nested in value:
+                if isinstance(nested, (dict, list, tuple)):
+                    TelemetrySpanValueIsolationTest._mutate(nested)
+
+    def build(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("a", parent={"p": [1]})
+        t.finish("a", error={"e": ["x"]})            # 默认服务、带容器异常
+        t.start("b", parent=("p", [{"k": "v"}]))      # 含嵌套可变值的元组父标识
+        t.finish("b")                                 # 成功结束
+        t.start("open", parent=["r", "a"])            # 开放跨度
+        t.start("c", service="api", parent={"s": [2]})  # 显式服务
+        t.finish("c", service="api", error=["bad", {"d": 1}])
+        return t
+
+    def test_query_results_are_isolated_and_repeatable(self):
+        t = self.build()
+        for status in ("open", "closed", "error"):
+            again = t.query(status)
+            result = t.query(status)
+            for record in result:
+                self._mutate(record["parent"])
+                self._mutate(record["error"])
+            result.append("junk")
+            self.assertEqual(t.query(status), again)  # 内部状态不被改写
+            self.assertTrue(
+                all(isinstance(item, dict) for item in t.query(status))
+            )
+
+    def test_mutating_one_record_does_not_touch_others(self):
+        t = self.build()
+        snap = t.snapshot()
+        errored = t.query("error")
+        snap_a = [r for r in snap["spans"] if r["span"] == "a"][0]
+        query_a = [r for r in errored if r["span"] == "a"][0]
+        snap_a["error"]["e"].append("z")
+        self.assertEqual(query_a["error"], {"e": ["x"]})
+        query_a["parent"]["p"].append("z")
+        self.assertEqual(snap_a["parent"], {"p": [1]})
+        # 同一次结果中的不同记录不共享容器
+        closed = t.query("closed")
+        parents = [
+            id(r["parent"]) for r in closed
+            if isinstance(r["parent"], (dict, list, tuple))
+        ]
+        self.assertEqual(len(parents), len(set(parents)))
+
+    def test_snapshot_and_json_unaffected_by_result_mutation(self):
+        t = self.build()
+        before = t.snapshot()
+        before_json = t.json()
+        snap = t.snapshot()
+        for record in snap["spans"]:
+            self._mutate(record["parent"])
+            self._mutate(record["error"])
+        snap["spans"].append("junk")
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.json(), before_json)
+
+    def test_trace_nodes_are_isolated(self):
+        t = Telemetry(iter(range(10)).__next__)
+        t.start("root", parent={"meta": [1]})
+        t.start("child", parent="root")
+        t.finish("child", error={"code": [5]})
+        tree = t.trace("root")
+        tree["parent"]["meta"].append("mut")
+        tree["children"][0]["error"]["code"].append("mut")
+        tree["children"].clear()
+        again = t.trace("root")
+        self.assertEqual(again["parent"], {"meta": [1]})
+        self.assertEqual(again["children"][0]["error"], {"code": [5]})
+        self.assertEqual([c["span"] for c in again["children"]], ["child"])
+
+    def test_input_objects_decoupled_after_start_and_finish(self):
+        parent = {"k": [1]}
+        error = {"e": [2]}
+        t = Telemetry(iter(range(10)).__next__)
+        t.start("s", parent=parent)
+        t.finish("s", error=error)
+        parent["k"].append(999)
+        parent["new"] = 1
+        error["e"].append(999)
+        error["new"] = 1
+        record = t.query("error")[0]
+        self.assertEqual(record["parent"], {"k": [1]})
+        self.assertEqual(record["error"], {"e": [2]})
+
+    def test_batch_inputs_are_isolated(self):
+        parent = {"p": [1]}
+        error = ["err", {"x": 1}]
+        t = Telemetry(iter(range(10)).__next__)
+        t.batch([
+            {"op": "start", "span": "s", "parent": parent},
+            {"op": "finish", "span": "s", "error": error},
+        ])
+        parent["p"].append(2)
+        error.append(2)
+        record = t.query("error")[0]
+        self.assertEqual(record["parent"], {"p": [1]})
+        self.assertEqual(record["error"], ["err", {"x": 1}])
+
+    def test_exception_instance_kept_raw_and_reads_repeatable(self):
+        error = ValueError("boom")
+        t = Telemetry(iter(range(10)).__next__)
+        t.start("s")
+        t.finish("s", error=error)
+        self.assertIs(t.query("error")[0]["error"], error)
+        self.assertIs(t.snapshot()["spans"][0]["error"], error)
+        self.assertIs(t.trace("s")["error"], error)
+        # 异常按身份比较：只有返回同一实例，重复读取才保持相等
+        self.assertEqual(t.query("error"), t.query("error"))
+        self.assertEqual(
+            json.loads(t.json())["spans"][0]["error"],
+            {"type": "ValueError", "message": "boom"},
+        )
+
+    def test_uncopiable_container_stays_raw_without_new_rejection(self):
+        import threading
+
+        lock = threading.Lock()
+        t = Telemetry(iter(range(10)).__next__)
+        t.start("s", parent=[lock, {"a": [1]}])  # 含不可复制对象，仍合法
+        t.finish("s", error={"lock": lock})
+        record = t.query("error")[0]
+        self.assertIs(record["parent"][0], lock)
+        self.assertIs(record["error"]["lock"], lock)
+        self.assertEqual(t.query("error"), t.query("error"))
+        self.assertIs(t.snapshot()["spans"][0]["parent"][0], lock)
+        self.assertIs(t.trace("s")["parent"][0], lock)
+
+    def test_restored_and_merged_spans_are_isolated(self):
+        payload = {
+            "counters": [],
+            "samples": [],
+            "spans": [
+                {"span": "r", "service": "", "parent": {"p": [1]},
+                 "start": 0, "end": 1, "error": {"e": [2]}},
+                {"span": "c", "service": "", "parent": "r",
+                 "start": 0.5, "end": None, "error": None},
+            ],
+        }
+        restored = Telemetry.from_snapshot(payload)
+        record = restored.query("error")[0]
+        record["parent"]["p"].append(9)
+        record["error"]["e"].append(9)
+        self.assertEqual(restored.query("error")[0]["parent"], {"p": [1]})
+        self.assertEqual(restored.query("error")[0]["error"], {"e": [2]})
+
+        merged = Telemetry(iter(range(50)).__next__)
+        merged.merge_snapshot(payload)
+        merged.query("error")[0]["error"]["e"].append(9)
+        self.assertEqual(merged.query("error")[0]["error"], {"e": [2]})
+
+        diff = Telemetry.diff_snapshots(
+            {"counters": [], "samples": [], "spans": []}, payload
+        )
+        diff["spans"]["added"][0]["parent"]["p"].append(9)
+        again = Telemetry.diff_snapshots(
+            {"counters": [], "samples": [], "spans": []}, payload
+        )
+        self.assertEqual(again["spans"]["added"][0]["parent"], {"p": [1]})
+
+        # 事后修改输入 payload 不影响已恢复/合并的实例
+        payload["spans"][0]["parent"]["p"].append(777)
+        payload["spans"][0]["error"]["e"].append(777)
+        self.assertEqual(restored.query("error")[0]["parent"], {"p": [1]})
+        self.assertEqual(merged.query("error")[0]["error"], {"e": [2]})
+
+
 if __name__ == "__main__":
     unittest.main()
