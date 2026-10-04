@@ -462,11 +462,6 @@ class Telemetry:
             "error": _isolate_mutable(record["error"]),
         }
 
-    def _span_entries(self):
-        # query 使用的无筛选跨度条目，保持既有排序；快照筛选与差异查询
-        # 统一走 _span_snapshot_pairs。
-        return [entry for _, entry in self._span_snapshot_pairs(self.spans)]
-
     @staticmethod
     def _span_snapshot_pairs(spans, service=None, status=None):
         # 跨度快照条目的唯一构造点：按服务、开始时间、标识稳定排序，
@@ -494,30 +489,30 @@ class Telemetry:
             and Telemetry._span_matches_status(entry, status)
         ]
 
-    def query(self, status):
+    def query(self, status, service=None):
         # open：end 仍为空；closed：end 已写入（成功结束与带异常结束都包含，
         # 不再看 error 真值）；error：已结束且 error 不为 None。任何非 None
         # 的结束 error 都算异常——0、False、空字符串、空列表、空字典等假值
-        # 也不例外，只有 None（JSON 中为 null）表示正常结束。只接受这三个
-        # 字符串，其他字符串、空值、非字符串一律 ValueError；拒绝发生在
-        # 读取任何跨度之前，不调用 clock，也不产生部分结果。每条命中都通过
+        # 也不例外，只有 None（JSON 中为 null）表示正常结束。status 只接受
+        # 这三个字符串，其他字符串、空值、非字符串一律 ValueError。service
+        # 是可选的服务筛选：缺省（None）不筛选，结果与既有单参数调用逐项
+        # 一致；提供时只接受字符串，空字符串表示默认服务，数字、字节串、
+        # 列表等其他类型一律 ValueError。所有拒绝都发生在读取任何跨度之前，
+        # 不调用 clock，不改变计数器、样本或跨度，也不产生部分结果。结果
+        # 仍按服务、start 时间、span 标识稳定排序；每条命中都通过
         # _span_entry 生成独立记录字典，其中的可变容器（parent/error 等字段
         # 里的列表、字典）同样逐层重建，调用方改写返回列表、记录或嵌套容器
         # 不影响 counters/samples/spans，也不影响同次结果中的其他记录；
         # error 原值（含异常实例）原样保留。
         if status not in ("open", "error", "closed"):
             raise ValueError("status must be 'open', 'error' or 'closed'")
-        result = []
-        for entry in self._span_entries():
-            if status == "open":
-                if entry["end"] is None:
-                    result.append(entry)
-            elif status == "closed":
-                if entry["end"] is not None:
-                    result.append(entry)
-            elif entry["end"] is not None and entry["error"] is not None:
-                result.append(entry)
-        return result
+        service = self._filter_service(service)
+        return [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status
+            )
+        ]
 
     def trace(self, span, service=None):
         """离线诊断：从指定跨度还原同一服务内的父子树。
