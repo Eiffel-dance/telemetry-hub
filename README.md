@@ -17,6 +17,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `query(status)`：仅接受 `'open'`（`end` 为空）、`'closed'`（`end` 已写入，成功结束与带异常结束都算）和 `'error'`（已结束且 `error` 非空），其他字符串、空值或非字符串值抛 `ValueError`（拒绝时不调用 clock、不留部分结果），无匹配返回 `[]`；结果含 `span/service/parent/start/end/error`，按服务、开始时间、标识排序；返回值为独立列表与独立记录，调用方修改不影响聚合器，`error` 原值（含异常对象）保留。
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
 - `percentile(name, q, labels=(), service=None)`：只读的分位数查询，用于离线诊断样本分布，调用方不需要先导出或修改聚合器状态。`service` 与 `labels` 的归一化规则与 `observe` 完全一致（`service` 缺省归一化为空字符串，显式传入必须是非空字符串；标签按键字典序归一化，重复键或不可 JSON 序列化抛 `ValueError`），`name` 必须可哈希才能作为样本键，不可哈希抛 `ValueError`。`q` 只接受非 `bool` 的 `int`/`float`，必须为有限值且落在 `[0, 100]` 闭区间，否则统一抛 `ValueError`；任何拒绝都发生在读取样本之前——不读 clock、不改变计数器、样本、跨度或输入对象，也不产生部分结果。样本键不存在或序列为空返回 `None`；命中时按公开浮点规则把每个值转换为数值并升序排序（排序副本不回写 `values`），以位置 `(n-1)*q/100` 线性插值，位置为整数时直接取该项，`q=0`/`q=100` 分别得到最小值/最大值，返回 Python `float`。该入口只读取当前聚合，重复调用结果相同，也不新增 `snapshot()`/`json()` 字段。
+- `histogram(name, boundaries, labels=(), service=None)`：只读的数值分布计数，用于离线诊断，调用方不需要先导出或修改聚合器状态。`service`、`labels` 与 `name` 的定位、默认服务、标签规范化与精确匹配规则与 `observe`/`percentile` 完全一致，非法值统一抛 `ValueError`。`boundaries` 必须是非空 `list` 或 `tuple`，元素必须是非 `bool` 的 `int`/`float`、有限且严格递增，任一不合法统一抛 `ValueError`，且全部边界校验在读取样本之前完成（不读 clock、不产生部分结果）。样本键不存在或序列为空返回 `None`；命中时每个样本先按 `observe` 的规则转成有限 `float`（已有数据无法转换时同样抛 `ValueError`，不返回部分结果），再按左开右闭分桶：第一桶统计小于等于 `boundaries[0]`，中间桶统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。返回全新字典，只含 `boundaries`（与输入顺序一致的独立列表）、`counts`（长度为 `len(boundaries)+1` 的整数列表）与 `count`（各桶计数之和）。每次调用都重新构造结果，修改返回值不影响内部状态，不读 clock、不改变样本顺序、也不触发序列化；该入口不改变 `percentile`/`snapshot()`/`json()` 的字段与结果。
 - `snapshot(service=None, labels=None, status=None)` / `json(service=None, labels=None, status=None)`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。三个筛选全部可省略，省略任一筛选即不按该维度限制，无参数调用结果与既有行为逐项一致，仍返回 `counters`、`samples`、`spans` 三个数组。`service` 缺省匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省匹配全部标签，提供时沿用 `observe` 的成对标签输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合与计数器/样本精确匹配（显式空序列只命中无标签记录），标签值无法通过既有规则时统一抛 `ValueError`；`status` 缺省保留所有服务的跨度，提供时只能是 `open`/`closed`/`error` 并使用 `query` 对结束与异常的既有定义。`service` 对三个数组同时生效，`status` 只作用于跨度，父标识不因筛选改写。任一筛选非法都在读取聚合前抛 `ValueError`——不调用 clock、不产生部分结果；没有匹配项时对应数组为空。命中的样本统计按原规则重算，排序顺序不变，返回的字典、数组与记录均为独立副本；同一组筛选可重复使用得到相同结果，筛选不写入、清空或重排内部数据。`json()` 同条件下可 JSON 表示的字段与 `snapshot()` 一致，`error` 继续按既有规则转换。
 - `Telemetry.from_snapshot(payload, clock=time.time)`：离线把 `snapshot()` 字典或 `json()` 文本重建为独立实例，计数器、样本原值与跨度的 parent/start/end/error 全部带回，样本统计按公开浮点规则从 values 重算（输入中存在的统计字段须与重算一致，空 values 不得携带统计）。payload 顶层只能含 `counters`、`samples`、`spans` 三个数组；缺字段、多字段、非法 JSON、重复记录、无效标签、不可哈希跨度标识、不可严格 JSON 表示的值等一律抛 `SnapshotFormatError`（`ValueError` 的子类），且失败前不留下半成品实例、不改动已有实例。恢复过程不联网、不读写文件、不修改输入；恢复后与原对象互不共享数据，`open` 跨度可继续用 `finish()` 结束。
 - `SnapshotFormatError`：快照恢复格式错误的公开异常类型，`ValueError` 的子类。所有快照恢复入口（`from_snapshot`/`merge_snapshot`/`diff_snapshots`/`restore`/`restore_snapshot`）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失或类型错误的字段、非有限数值、无法按既有规则规范化的标签、悬空或成环的父子引用、重复跨度标识等输入问题统一抛出本异常；既有按 `ValueError` 捕获的调用方行为不变。
@@ -42,5 +43,21 @@ t.percentile("missing", 95)               # None：样本键不存在
 t.percentile("size", 95)                  # None：服务不同即键不存在
 t.percentile("size", 101, service="api")  # ValueError：q 超出 [0, 100]
 t.percentile("size", True, service="api") # ValueError：bool 不是可接受的 q
+```
+
+## histogram 示例
+
+```python
+t = Telemetry()
+for v in (0, 1, 2, 2, 5, 9, 10, 10.5, 11):
+    t.observe("x", v)
+t.histogram("x", [1, 5, 10])
+# {'boundaries': [1, 5, 10], 'counts': [2, 3, 2, 2], 'count': 9}
+# <=1: 0,1 ｜ (1,5]: 2,2,5 ｜ (5,10]: 9,10 ｜ >10: 10.5,11（左开右闭）
+
+t.histogram("missing", [1, 2])            # None：样本键不存在
+t.histogram("x", [])                      # ValueError：boundaries 必须非空
+t.histogram("x", [5, 1])                  # ValueError：必须严格递增
+t.histogram("x", [1, True])               # ValueError：bool 不是合法边界
 ```
 

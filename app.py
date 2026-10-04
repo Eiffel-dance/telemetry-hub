@@ -609,6 +609,100 @@ class Telemetry:
         return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
 
     @staticmethod
+    def _check_histogram_boundaries(boundaries):
+        # 分桶边界必须是非空 list/tuple；元素必须是非 bool 的 int/float、
+        # 有限且严格递增。bool 是 int 的子类必须显式排除；Decimal、字符串
+        # 等其他类型一律拒绝。返回独立列表，后续分桶与返回值都不再接触
+        # 调用方传入的容器。
+        if not isinstance(boundaries, (list, tuple)) or len(boundaries) == 0:
+            raise ValueError(
+                "boundaries must be a non-empty list or tuple, got %r"
+                % (boundaries,)
+            )
+        checked = []
+        previous = None
+        for index, boundary in enumerate(boundaries):
+            if isinstance(boundary, bool) or not isinstance(
+                boundary, (int, float)
+            ):
+                raise ValueError(
+                    "histogram boundary must be a non-bool int or float,"
+                    " got %r" % (boundary,)
+                )
+            if not math.isfinite(boundary):
+                raise ValueError(
+                    "histogram boundary must be finite, got %r" % (boundary,)
+                )
+            if index > 0 and not boundary > previous:
+                raise ValueError(
+                    "histogram boundaries must be strictly increasing"
+                )
+            checked.append(boundary)
+            previous = boundary
+        return checked
+
+    def histogram(self, name, boundaries, labels=(), service=None):
+        """离线诊断：对一条已记录的样本序列按边界做分布计数，只读不改状态。
+
+        service、labels 与 name 的定位规则与 observe/percentile 完全一致
+        （service 缺省为默认服务，显式传入必须是非空字符串；标签按键排序、
+        拒绝重复键与不可序列化值；name 必须可哈希）。boundaries 必须是非空
+        list/tuple，元素必须是非 bool 的 int/float、有限且严格递增；任一
+        不合法统一抛 ValueError，且所有边界校验在读取样本之前完成。
+
+        样本键不存在或序列为空返回 None。命中时每个样本先按 observe 的规则
+        转成有限 float（已有数据无法转换时同样抛 ValueError，不返回部分
+        结果），再按左开右闭分桶：第一桶统计 <= boundaries[0]，中间桶统计
+        大于前一边界且不超过当前边界，最后一桶统计大于最后边界。返回全新
+        字典，只含 boundaries 的独立列表、长度为 len(boundaries)+1 的
+        counts 整数列表与 count（各桶之和），顺序与输入边界一致。每次调用
+        都重新构造结果，不读 clock、不改变样本顺序、不触发序列化，修改
+        返回值不影响内部状态。
+        """
+        service = self._service(service)
+        labels = self._normalize_labels(labels)
+        self._restore_hashable(name, "name")
+        # 边界全部校验并复制后才读取样本：非法边界绝不产生部分结果。
+        boundaries = self._check_histogram_boundaries(boundaries)
+        values = self.samples.get((service, name, labels))
+        if not values:  # 键不存在或空序列：无分布可言
+            return None
+        # 全部样本先转成有限 float：任一失败统一 ValueError，先转换完再
+        # 分桶，保证不会边计数边失败而返回部分结果。
+        numbers = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                raise ValueError("sample value must be numeric")
+            if math.isnan(number) or math.isinf(number):
+                raise ValueError(
+                    "sample value must be finite, got %r" % (value,)
+                )
+            numbers.append(number)
+        counts = [0] * (len(boundaries) + 1)
+        first_boundary = boundaries[0]
+        last_boundary = boundaries[-1]
+        for number in numbers:
+            # 左开右闭：第一桶 v <= b0；最后一桶 v > b_last；中间桶 i
+            # （1 <= i <= len-1）为 b_{i-1} < v <= b_i。边界严格递增，
+            # 每个值恰好落入一个桶。
+            if number <= first_boundary:
+                counts[0] += 1
+            elif number > last_boundary:
+                counts[-1] += 1
+            else:
+                for index in range(1, len(boundaries)):
+                    if number <= boundaries[index]:
+                        counts[index] += 1
+                        break
+        return {
+            "boundaries": list(boundaries),
+            "counts": counts,
+            "count": sum(counts),
+        }
+
+    @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
         total = 0.0
