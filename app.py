@@ -240,9 +240,10 @@ class Telemetry:
         samples.setdefault(key, []).append(value)
 
     @staticmethod
-    def _apply_start(spans, service, span, parent, timestamper):
+    def _apply_start(spans, service, span, parent, labels, timestamper):
         # 跨度创建的唯一实现点：重复校验先于时间戳读取，
-        # timestamper 每次创建只被调用一次。
+        # timestamper 每次创建只被调用一次。labels 是已归一化的冻结标签，
+        # 在跨度开始时确定并随记录保存，finish 与任何其他入口都不改写它。
         key = (service, span)
         if key in spans:
             raise ValueError(
@@ -253,6 +254,7 @@ class Telemetry:
             "start": timestamper(),
             "end": None,
             "error": None,
+            "labels": labels,
         }
 
     @staticmethod
@@ -272,16 +274,20 @@ class Telemetry:
         record["end"] = timestamper()
         record["error"] = error
 
-    def start(self, span, parent=None, service=None):
-        # 写入前先完成 service 与 span 的有效性检查：service 缺省归一化为
-        # 空字符串，显式传入必须是非空字符串；span 必须可哈希。任一校验
-        # 失败都不推进 clock、不留下半条记录。
+    def start(self, span, parent=None, service=None, labels=()):
+        # 写入前先完成 service、span 与 labels 的有效性检查：service 缺省归一化
+        # 为空字符串，显式传入必须是非空字符串；span 必须可哈希；labels 沿用
+        # observe 的成对输入、键排序、重复键与严格 JSON 校验，归一化只构造新
+        # 结构，调用方的可变对象不被修改。任一校验失败都不推进 clock、不留下
+        # 半条记录。
         service = self._service(service)
         self._restore_hashable(span, "span")
+        labels = self._normalize_labels(labels)
         # 跨度由 service 与 span 共同唯一标识：无论同标识跨度仍未结束还是
-        # 已经结束，重复开始一律拒绝，原有 parent/start/end/error 不被覆盖，
-        # clock 也不被推进。
-        self._apply_start(self.spans, service, span, parent, self.clock)
+        # 已经结束，重复开始一律拒绝，原有 parent/start/end/error/labels 不被
+        # 覆盖，clock 也不被推进。标签在创建时写入记录，finish 只结束既有
+        # 跨度，不能改写它。
+        self._apply_start(self.spans, service, span, parent, labels, self.clock)
 
     def finish(self, span, error=None, service=None):
         # 与 start 相同的入站校验顺序；被拒绝的调用不读取或生成时间戳。
@@ -299,7 +305,7 @@ class Telemetry:
     _BATCH_FIELDS = {
         "inc": {"name", "value", "labels", "service"},
         "observe": {"name", "value", "labels", "service"},
-        "start": {"span", "parent", "service"},
+        "start": {"span", "parent", "service", "labels"},
         "finish": {"span", "error", "service"},
     }
 
@@ -349,8 +355,8 @@ class Telemetry:
                 _, service, name, value, labels = action
                 self._apply_observe(samples, service, name, value, labels)
             elif kind == "start":
-                _, service, span, parent = action
-                self._apply_start(spans, service, span, parent, self.clock)
+                _, service, span, parent, labels = action
+                self._apply_start(spans, service, span, parent, labels, self.clock)
             else:
                 _, service, span, error = action
                 self._apply_finish(spans, service, span, error, self.clock)
@@ -417,15 +423,17 @@ class Telemetry:
                     self._apply_observe(samples, service, name, value, labels)
                     actions.append(("observe", service, name, value, labels))
                 elif op == "start":
-                    # 与 start 一致：service、span 可哈希，再在影子上查重。
+                    # 与 start 一致：service、span 可哈希、labels 归一化，
+                    # 再在影子上查重；labels 缺省为空标签。
                     service = self._service(event.get("service"))
                     span = event["span"]
                     self._restore_hashable(span, "span")
+                    labels = self._normalize_labels(event.get("labels", ()))
                     parent = event.get("parent", None)
                     self._apply_start(
-                        spans, service, span, parent, lambda: planned
+                        spans, service, span, parent, labels, lambda: planned
                     )
-                    actions.append(("start", service, span, parent))
+                    actions.append(("start", service, span, parent, labels))
                 else:
                     # 与 finish 一致：service、span 可哈希，再查不存在/已结束。
                     service = self._service(event.get("service"))
@@ -453,7 +461,9 @@ class Telemetry:
         # start、end、error 中的可变容器逐层重建——调用方改写返回记录
         # 或其嵌套容器不会回流到聚合器，同次结果中的记录之间也互不共享；
         # 标量、异常实例与自定义对象保持入口的原值语义，原样返回。
-        return {
+        # 有标签的跨度附加 labels 字段（按键序的成对列表，数组/对象值
+        # 重建为全新对象，可安全修改）；无标签跨度保持既有字段形状。
+        entry = {
             "span": span,
             "service": service,
             "parent": _isolate_mutable(record["parent"]),
@@ -461,35 +471,42 @@ class Telemetry:
             "end": _isolate_mutable(record["end"]),
             "error": _isolate_mutable(record["error"]),
         }
+        labels = record["labels"]
+        if labels:
+            entry["labels"] = _thaw_labels(labels)
+        return entry
 
     @staticmethod
-    def _span_snapshot_pairs(spans, service=None, status=None):
+    def _span_snapshot_pairs(spans, service=None, status=None, labels=None):
         # 跨度快照条目的唯一构造点：按服务、开始时间、标识稳定排序，
-        # 返回 (service, span) 定位键与完整记录。service/status 筛选与
-        # snapshot 原有筛选逐项一致，缺省（None）即不限制。
+        # 返回 (service, span) 定位键与完整记录。service/status/labels
+        # 筛选与 snapshot 原有筛选逐项一致，缺省（None）即不限制；
+        # labels 提供时按归一化后的完整标签集合与记录内的冻结标签精确
+        # 匹配（显式空标签只命中无标签记录），不接触输出副本。
         pairs = [
-            ((svc, span), Telemetry._span_entry(svc, span, record))
+            ((svc, span), Telemetry._span_entry(svc, span, record), record["labels"])
             for (svc, span), record in spans.items()
         ]
         pairs.sort(
-            key=lambda pair: _OrderableTuple(
+            key=lambda item: _OrderableTuple(
                 (
-                    pair[1]["service"],
-                    pair[1]["start"],
-                    pair[1]["span"],
+                    item[1]["service"],
+                    item[1]["start"],
+                    item[1]["span"],
                 )
             )
         )
-        if service is None and status is None:
-            return pairs
+        if service is None and status is None and labels is None:
+            return [(key, entry) for key, entry, _ in pairs]
         return [
             (key, entry)
-            for key, entry in pairs
+            for key, entry, record_labels in pairs
             if (service is None or entry["service"] == service)
             and Telemetry._span_matches_status(entry, status)
+            and (labels is None or record_labels == labels)
         ]
 
-    def query(self, status, service=None):
+    def query(self, status, service=None, labels=None):
         # open：end 仍为空；closed：end 已写入（成功结束与带异常结束都包含，
         # 不再看 error 真值）；error：已结束且 error 不为 None。任何非 None
         # 的结束 error 都算异常——0、False、空字符串、空列表、空字典等假值
@@ -497,20 +514,28 @@ class Telemetry:
         # 这三个字符串，其他字符串、空值、非字符串一律 ValueError；service
         # 为可选服务筛选，规则与 snapshot/json 的服务筛选一致：缺省（None）
         # 不按服务限制，提供时只能是字符串，空字符串表示默认服务，数字、
-        # 字节串、列表等其他类型一律 ValueError。所有拒绝都发生在读取任何
-        # 跨度之前，不调用 clock，也不产生部分结果，聚合状态保持调用前不变。
-        # 排序沿用快照的服务、开始时间、标识顺序；省略 service 时结果与既有
+        # 字节串、列表等其他类型一律 ValueError；labels 为可选标签筛选，
+        # 缺省（None）匹配全部标签，提供时沿用 observe 的成对输入、键排序、
+        # 重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式
+        # 空序列只命中无标签记录）。所有拒绝都发生在读取任何跨度之前，
+        # 不调用 clock，也不产生部分结果，聚合状态保持调用前不变。
+        # 排序沿用快照的服务、开始时间、标识顺序；省略筛选时结果与既有
         # query(status) 逐项一致。每条命中都通过 _span_entry 生成独立记录
         # 字典，其中的可变容器（parent/error 等字段里的列表、字典）同样逐层
         # 重建，调用方改写返回列表、记录或嵌套容器不影响 counters/samples/
         # spans，也不影响同次结果中的其他记录；error 原值（含异常实例）原样
-        # 保留。无匹配返回空列表。
+        # 保留。有标签的跨度附加可安全修改的 labels 字段，无标签跨度保持
+        # 既有字段形状。无匹配返回空列表。
         if status not in ("open", "error", "closed"):
             raise ValueError("status must be 'open', 'error' or 'closed'")
         service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
         return [
             entry
-            for _, entry in self._span_snapshot_pairs(self.spans, service, status)
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status, labels
+            )
         ]
 
     def trace(self, span, service=None):
@@ -753,15 +778,16 @@ class Telemetry:
         samples、spans 三个数组。service 缺省匹配全部服务，提供时必须是字符
         串，空字符串表示默认服务；labels 缺省匹配全部标签，提供时沿用 observe
         的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合
-        与计数器/样本精确匹配（显式传空序列只命中无标签记录）；status 缺省
+        与计数器/样本/跨度精确匹配（显式传空序列只命中无标签记录）；status 缺省
         保留所有服务的跨度，提供时只能是 open/closed/error，判定与 query 完全
-        相同。service 对三个数组同时生效，status 只作用于跨度，父标识不随筛选
-        改写。任一筛选非法都在读取聚合前抛 ValueError：不调用 clock、不产生
+        相同。service 与 labels 对三个数组同时生效，status 只作用于跨度，父标识
+        不随筛选改写。任一筛选非法都在读取聚合前抛 ValueError：不调用 clock、不产生
         部分结果；无匹配时对应数组为空。统计只对命中的样本序列按原规则重算，
         排序仍按服务、名称、标签或跨度开始时间、标识的稳定顺序。返回的字典、
         数组与记录均为独立副本，跨度记录中 parent/error 等字段的可变容器也
-        逐层重建，与内部状态及同次结果的其他记录互不共享；重复使用同一组筛选
-        结果相同，筛选不写入、清空或重排任何内部数据。
+        逐层重建，与内部状态及同次结果的其他记录互不共享；有标签的跨度条目
+        附加 labels 字段（可安全修改的成对列表），无标签条目保持既有字段
+        形状；重复使用同一组筛选结果相同，筛选不写入、清空或重排任何内部数据。
         """
         # 全部筛选先校验、归一化，之后才读取聚合，保证非法筛选不产生部分
         # 结果；整个过程纯只读，不调用 clock。
@@ -785,7 +811,7 @@ class Telemetry:
         spans = [
             entry
             for _, entry in self._span_snapshot_pairs(
-                self.spans, service, status
+                self.spans, service, status, labels
             )
         ]
 
@@ -1086,9 +1112,9 @@ class Telemetry:
         全部省略时与两参数调用逐项一致；service 缺省匹配全部服务，提供时
         只能是字符串（空字符串表示默认服务）；labels 缺省匹配全部标签，
         提供时沿用 observe 的成对输入、键排序、重复键与严格 JSON 校验，
-        按归一化后的完整标签集合与计数器/样本精确匹配，不作用于跨度；
-        status 缺省匹配全部跨度，提供时只接受 open/closed/error 且只作用
-        于跨度，计数器与样本仍按原规则参与比较。任一筛选非法都在解析输入
+        按归一化后的完整标签集合与计数器/样本/跨度精确匹配（显式空序列
+        只命中无标签记录）；status 缺省匹配全部跨度，提供时只接受
+        open/closed/error 且只作用于跨度，计数器与样本仍按原规则参与比较。任一筛选非法都在解析输入
         前抛 ValueError。before 与 after 各自先完成完整快照解析与严格校验，
         再独立应用同一组筛选，最后按既有定位键生成差异：筛选导致某条跨度
         只在一侧可见时，按筛选后的视图判定 added 或 removed。
@@ -1100,7 +1126,7 @@ class Telemetry:
         同一定位但内容不同的进入 changed（元素为 {"before": ..., "after": ...}
         两份相互独立的完整记录）。样本先按 values 与公开浮点统计重新归一再
         比较，输入携带或省略等价统计字段不算变化；跨度 open→closed、error
-        变化、parent 变化等任何字段差异都算 changed。added/removed 沿用各
+        变化、parent 变化、labels 变化等任何字段差异都算 changed。added/removed 沿用各
         自快照的稳定排序，changed 按 after 记录的快照排序；无差异对应数组
         为空。返回的记录与嵌套标签均可安全修改，与两个输入互不共享。
         """
@@ -1148,8 +1174,8 @@ class Telemetry:
 
         before_counters, before_samples, before_spans = before_state
         after_counters, after_samples, after_spans = after_state
-        # 两侧在校验后的完整状态上独立应用同一组筛选：service 对三个分区
-        # 同时生效，labels 只作用于计数器/样本，status 只作用于跨度。
+        # 两侧在校验后的完整状态上独立应用同一组筛选：service 与 labels 对
+        # 三个分区同时生效，status 只作用于跨度。
         # 统计重算阶段若仍遇到转换失败（如不可复现的自定义 __float__），
         # 同样归为 SnapshotFormatError，不向外泄漏其他异常类型。
         try:
@@ -1163,8 +1189,8 @@ class Telemetry:
                     cls._sample_snapshot_pairs(after_samples, service, labels),
                 ),
                 "spans": diff_section(
-                    cls._span_snapshot_pairs(before_spans, service, status),
-                    cls._span_snapshot_pairs(after_spans, service, status),
+                    cls._span_snapshot_pairs(before_spans, service, status, labels),
+                    cls._span_snapshot_pairs(after_spans, service, status, labels),
                 ),
             }
         except ValueError as exc:
@@ -1397,12 +1423,14 @@ class Telemetry:
     @classmethod
     def _restore_spans(cls, records):
         spans = {}
-        fields = {"span", "service", "parent", "start", "end", "error"}
+        required = {"span", "service", "parent", "start", "end", "error"}
+        allowed = required | {"labels"}  # labels 可选，缺省按空标签恢复
         for record in records:
-            if not isinstance(record, dict) or set(record) != fields:
+            keys = set(record) if isinstance(record, dict) else set()
+            if not isinstance(record, dict) or not required <= keys or not keys <= allowed:
                 raise SnapshotFormatError(
-                    "span record must have exactly"
-                    " span, service, parent, start, end, error"
+                    "span record must have span, service, parent, start, end,"
+                    " error and optionally labels"
                 )
             service = cls._restore_service(record["service"])
             span = cls._restore_json_strict(record["span"], "span")
@@ -1416,6 +1444,12 @@ class Telemetry:
             if end is not None:  # 结束时间只能为空或已结束值
                 cls._restore_json_strict(end, "end")
             error = cls._restore_json_strict(record["error"], "error")
+            # 缺少 labels 的旧快照按空标签恢复；提供时沿用既有标签归一化，
+            # 重复键、非法键序或不可严格 JSON 表示的值统一为 SnapshotFormatError。
+            if "labels" in record:
+                labels = cls._restore_labels(record["labels"])
+            else:
+                labels = ()
             key = (service, span)
             if key in spans:
                 raise SnapshotFormatError("duplicate span record")
@@ -1424,5 +1458,6 @@ class Telemetry:
                 "start": start,
                 "end": end,
                 "error": error,
+                "labels": labels,
             }
         return spans

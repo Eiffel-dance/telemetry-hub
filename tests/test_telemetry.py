@@ -929,9 +929,15 @@ class TelemetrySnapshotFilterTest(unittest.TestCase):
         self.assertEqual(lab["samples"], [])
         # 输入顺序不同、归一化后相同 -> 精确命中同一集合
         self.assertEqual(t.snapshot(labels=(("b", 2), ("a", 1))), lab)
-        # 标签筛选不限制跨度
+        # 标签筛选同样作用于跨度：build 中的跨度全部无标签，
+        # 非空标签筛选不命中任何跨度
         self.assertEqual(
             t.snapshot(labels=(("a", 1), ("b", 2)))["spans"],
+            [],
+        )
+        # 显式空标签命中全部无标签跨度
+        self.assertEqual(
+            t.snapshot(labels=())["spans"],
             t.snapshot()["spans"],
         )
         # 显式空标签只命中无标签记录
@@ -1981,6 +1987,221 @@ class TelemetryHistogramTest(unittest.TestCase):
         self.assertEqual(
             merged.histogram("x", (1, 5, 10))["counts"], [2, 3, 2, 2]
         )
+
+
+class TelemetrySpanLabelsTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("plain")                                  # 默认服务，无标签
+        t.start("tagged", labels=(("k", "v"),))           # 默认服务，有标签
+        t.start("other", labels=(("k", "w"),), service="api")
+        return t
+
+    def test_start_labels_normalized_and_caller_untouched(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        lab = [["b", [2, 1]], ("a", {"x": 1})]
+        t.start("s", labels=lab, service="api")
+        # 调用方的可变对象不被修改
+        self.assertEqual(lab, [["b", [2, 1]], ("a", {"x": 1})])
+        entry = t.query("open")[0]
+        # 键顺序归一；数组/对象值按原结构带回
+        self.assertEqual(entry["labels"], [("a", {"x": 1}), ("b", [2, 1])])
+        # 返回的 labels 可安全修改，不回流到聚合器
+        entry["labels"][0][1]["x"] = 999
+        self.assertEqual(
+            t.query("open")[0]["labels"], [("a", {"x": 1}), ("b", [2, 1])]
+        )
+
+    def test_unlabeled_span_keeps_existing_shape(self):
+        t = self.build()
+        for entry in t.query("open", labels=()):
+            self.assertEqual(
+                set(entry),
+                {"span", "service", "parent", "start", "end", "error"},
+            )
+
+    def test_finish_does_not_rewrite_labels(self):
+        t = self.build()
+        t.finish("tagged")
+        closed = t.query("closed", labels=(("k", "v"),))
+        self.assertEqual([e["span"] for e in closed], ["tagged"])
+        self.assertEqual(closed[0]["labels"], [("k", "v")])
+
+    def test_start_labels_validation(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        for bad in (
+            [("a", 1), ("a", 2)],          # 重复键
+            [("a", float("nan"))],         # 非严格 JSON
+            "not-pairs",                   # 非成对输入
+            [("a", object())],             # 不可序列化值
+        ):
+            with self.assertRaises(ValueError):
+                t.start("s", labels=bad)
+        # 非法标签不推进 clock、不留半条记录
+        self.assertEqual(t.query("open"), [])
+        # 重复开始（含带标签）仍拒绝，原标签不被覆盖
+        t.start("s", labels=(("k", "v"),))
+        with self.assertRaises(ValueError):
+            t.start("s", labels=(("k", "other"),))
+        self.assertEqual(t.query("open")[0]["labels"], [("k", "v")])
+
+    def test_query_labels_filter(self):
+        t = self.build()
+        # 省略筛选匹配全部
+        self.assertEqual(
+            [e["span"] for e in t.query("open")],
+            ["plain", "tagged", "other"],
+        )
+        self.assertEqual(t.query("open"), t.query("open", labels=None))
+        # 显式空标签只命中无标签记录
+        self.assertEqual([e["span"] for e in t.query("open", labels=())], ["plain"])
+        # 规范化键值精确匹配（输入顺序无关）
+        self.assertEqual(
+            [e["span"] for e in t.query("open", labels=(("k", "v"),))],
+            ["tagged"],
+        )
+        # 与服务筛选组合
+        self.assertEqual(
+            [e["span"] for e in t.query("open", service="api", labels=(("k", "w"),))],
+            ["other"],
+        )
+        # 无匹配返回空列表
+        self.assertEqual(t.query("open", labels=(("k", "missing"),)), [])
+        # 非法筛选抛 ValueError，状态不变
+        with self.assertRaises(ValueError):
+            t.query("open", labels=[("a", 1), ("a", 1)])
+        self.assertEqual(len(t.query("open")), 3)
+
+    def test_snapshot_and_json_labels_filter_spans(self):
+        t = self.build()
+        snap = t.snapshot(labels=(("k", "v"),))
+        self.assertEqual([s["span"] for s in snap["spans"]], ["tagged"])
+        self.assertEqual(snap["spans"][0]["labels"], [("k", "v")])
+        # 显式空标签命中无标签跨度，无标签条目保持既有字段形状
+        empty = t.snapshot(labels=())
+        self.assertEqual([s["span"] for s in empty["spans"]], ["plain"])
+        self.assertNotIn("labels", empty["spans"][0])
+        # json 与 snapshot 同口径
+        parsed = json.loads(t.json(labels=(("k", "w"),)))
+        self.assertEqual([s["span"] for s in parsed["spans"]], ["other"])
+        self.assertEqual(parsed["spans"][0]["labels"], [["k", "w"]])
+
+    def test_trace_nodes_carry_labels(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("root", labels=(("role", "root"),))
+        t.start("child", parent="root", labels=(("role", "leaf"),))
+        t.start("plain-child", parent="root")
+        tree = t.trace("root")
+        self.assertEqual(tree["labels"], [("role", "root")])
+        children = {c["span"]: c for c in tree["children"]}
+        self.assertEqual(children["child"]["labels"], [("role", "leaf")])
+        self.assertNotIn("labels", children["plain-child"])
+        # 返回的 labels 可安全修改
+        tree["children"][0]["labels"].append(("hack", 1))
+        self.assertEqual(
+            t.trace("root")["children"][0]["labels"], [("role", "leaf")]
+        )
+
+    def test_snapshot_roundtrip_with_labels(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("a", labels=(("x", 1),))
+        t.finish("a")
+        t.start("b")
+        snap = t.snapshot()
+        spans = {s["span"]: s for s in snap["spans"]}
+        self.assertEqual(spans["a"]["labels"], [("x", 1)])
+        self.assertNotIn("labels", spans["b"])
+        for payload in (snap, t.json()):
+            restored = Telemetry.restore(payload)
+            self.assertEqual(restored.snapshot(), snap)
+            resumed = Telemetry(iter(range(1000, 2000)).__next__)
+            resumed.restore_snapshot(payload)
+            self.assertEqual(resumed.snapshot(), snap)
+
+    def test_restore_missing_and_invalid_labels(self):
+        base = {"span": "s", "service": "", "parent": None,
+                "start": 1, "end": None, "error": None}
+        empty = {"counters": [], "samples": [], "spans": [base]}
+        # 缺少 labels 的旧快照按空标签恢复
+        restored = Telemetry.from_snapshot(empty)
+        self.assertNotIn("labels", restored.snapshot()["spans"][0])
+        # 显式空 labels 等价于无标签
+        explicit = {"counters": [], "samples": [],
+                    "spans": [dict(base, labels=[])]}
+        self.assertNotIn(
+            "labels", Telemetry.from_snapshot(explicit).snapshot()["spans"][0]
+        )
+        # 非法 labels 一律 SnapshotFormatError
+        for bad in (
+            dict(base, labels=[("a", 1), ("a", 2)]),
+            dict(base, labels="x"),
+            dict(base, labels=[("a", float("nan"))]),
+            dict(base, labels=[("a", 1)], extra=1),
+        ):
+            with self.assertRaises(SnapshotFormatError):
+                Telemetry.from_snapshot(
+                    {"counters": [], "samples": [], "spans": [bad]}
+                )
+
+    def test_merge_label_conflict_atomic(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("m", labels=(("k", "v"),))
+        snap = t.snapshot()
+        other = Telemetry(iter(range(1000)).__next__)
+        other.merge_snapshot(snap)
+        self.assertEqual(other.snapshot(), snap)  # 一致时幂等
+        conflict = copy.deepcopy(snap)
+        conflict["spans"][0]["labels"] = [["k", "other"]]
+        before = other.snapshot()
+        with self.assertRaises(ValueError):
+            other.merge_snapshot(conflict)
+        self.assertEqual(other.snapshot(), before)  # 原子失败，无部分状态
+
+    def test_diff_label_change_is_changed(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("m", labels=(("k", "v"),))
+        before = t.snapshot()
+        after = copy.deepcopy(before)
+        after["spans"][0]["labels"] = [["k", "other"]]
+        diff = Telemetry.diff_snapshots(before, after)
+        self.assertEqual(diff["spans"]["added"], [])
+        self.assertEqual(diff["spans"]["removed"], [])
+        self.assertEqual(len(diff["spans"]["changed"]), 1)
+        changed = diff["spans"]["changed"][0]
+        self.assertEqual(changed["before"]["labels"], [("k", "v")])
+        self.assertEqual(changed["after"]["labels"], [("k", "other")])
+        # labels 筛选作用于 spans：after 侧标签不匹配时按 removed 判定
+        filtered = Telemetry.diff_snapshots(before, after, labels=(("k", "v"),))
+        self.assertEqual(len(filtered["spans"]["removed"]), 1)
+        self.assertEqual(filtered["spans"]["changed"], [])
+
+    def test_batch_start_labels(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.batch([
+            {"op": "start", "span": "b1", "labels": (("z", 1),)},
+            {"op": "finish", "span": "b1"},
+        ])
+        self.assertEqual(t.query("closed")[0]["labels"], [("z", 1)])
+        # 非法 labels 整批拒绝，不留部分状态
+        with self.assertRaises(ValueError):
+            t.batch([
+                {"op": "start", "span": "b2", "labels": [("a", 1), ("a", 2)]},
+            ])
+        self.assertEqual(t.query("open"), [])
+        # 未知字段仍拒绝
+        with self.assertRaises(ValueError):
+            t.batch([{"op": "finish", "span": "b1", "labels": ()}])
+
+    def test_invalid_filter_does_not_read_clock(self):
+        calls = []
+        t = Telemetry(lambda: calls.append(1) or 0.0)
+        with self.assertRaises(ValueError):
+            t.snapshot(labels=[("a", 1), ("a", 1)])
+        with self.assertRaises(ValueError):
+            t.query("open", labels="bad")
+        with self.assertRaises(ValueError):
+            t.start("s", labels=[("a", 1), ("a", 1)])
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
