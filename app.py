@@ -207,14 +207,23 @@ class Telemetry:
         self._apply_observe(self.samples, service, name, value, labels)
 
     @staticmethod
-    def _check_sample_value(value):
-        # observe 的样本入站规则：可转 float 且必须有限，原值由调用方保留。
+    def _finite_float(value):
+        # 样本数值转换的唯一实现点：float() 的 TypeError/ValueError、超大
+        # 整数转换的 OverflowError，以及自定义 __float__ 抛出的其他异常，
+        # 一律归为公开的 ValueError，绝不向调用方泄漏底层异常；转换结果
+        # 必须有限。返回转换后的 float，原值是否保留由调用方决定。
         try:
             numeric = float(value)
-        except (TypeError, ValueError):
+        except Exception:
             raise ValueError("sample value must be numeric")
         if math.isnan(numeric) or math.isinf(numeric):
             raise ValueError("sample value must be finite, got %r" % (value,))
+        return numeric
+
+    @classmethod
+    def _check_sample_value(cls, value):
+        # observe 的样本入站规则：可转 float 且必须有限，原值由调用方保留。
+        cls._finite_float(value)
         return value
 
     @staticmethod
@@ -572,7 +581,9 @@ class Telemetry:
         # 其他数值类型（Decimal、Fraction、字符串等）一律拒绝。
         if isinstance(q, bool) or not isinstance(q, (int, float)):
             raise ValueError("q must be an int or float, got %r" % (q,))
-        if not math.isfinite(q):
+        # int 必然有限（超大 int 交给 math.isfinite 反而会抛 OverflowError），
+        # 只有 float 需要有限性检查；超大 int 随后被区间检查确定地拒绝。
+        if isinstance(q, float) and not math.isfinite(q):
             raise ValueError("q must be finite, got %r" % (q,))
         if q < 0 or q > 100:
             raise ValueError("q must be within [0, 100], got %r" % (q,))
@@ -599,7 +610,9 @@ class Telemetry:
         values = self.samples.get((service, name, labels))
         if not values:  # 键不存在或空序列：无分位数可言
             return None
-        ordered = sorted(float(value) for value in values)
+        # 既有样本按公开浮点规则转换：超大整数溢出、自定义 __float__ 失败
+        # 等转换问题与 observe 入站一样统一为 ValueError，不返回部分结果。
+        ordered = sorted(self._finite_float(value) for value in values)
         position = (len(ordered) - 1) * q / 100.0
         lower = int(math.floor(position))
         upper = int(math.ceil(position))
@@ -629,7 +642,7 @@ class Telemetry:
                     "histogram boundary must be a non-bool int or float,"
                     " got %r" % (boundary,)
                 )
-            if not math.isfinite(boundary):
+            if isinstance(boundary, float) and not math.isfinite(boundary):
                 raise ValueError(
                     "histogram boundary must be finite, got %r" % (boundary,)
                 )
@@ -667,19 +680,10 @@ class Telemetry:
         values = self.samples.get((service, name, labels))
         if not values:  # 键不存在或空序列：无分布可言
             return None
-        # 全部样本先转成有限 float：任一失败统一 ValueError，先转换完再
-        # 分桶，保证不会边计数边失败而返回部分结果。
-        numbers = []
-        for value in values:
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                raise ValueError("sample value must be numeric")
-            if math.isnan(number) or math.isinf(number):
-                raise ValueError(
-                    "sample value must be finite, got %r" % (value,)
-                )
-            numbers.append(number)
+        # 全部样本先转成有限 float：任一失败统一 ValueError（含超大整数
+        # 溢出与自定义 __float__ 异常），先转换完再分桶，保证不会边计数
+        # 边失败而返回部分结果。
+        numbers = [self._finite_float(value) for value in values]
         counts = [0] * (len(boundaries) + 1)
         first_boundary = boundaries[0]
         last_boundary = boundaries[-1]
@@ -704,7 +708,8 @@ class Telemetry:
 
     @staticmethod
     def _sample_stats(values):
-        floats = [float(value) for value in values]
+        # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
+        floats = [Telemetry._finite_float(value) for value in values]
         total = 0.0
         for number in floats:  # 按 values 写入顺序累加
             total += number
@@ -1151,20 +1156,25 @@ class Telemetry:
         after_counters, after_samples, after_spans = after_state
         # 两侧在校验后的完整状态上独立应用同一组筛选：service 对三个分区
         # 同时生效，labels 只作用于计数器/样本，status 只作用于跨度。
-        result = {
-            "counters": diff_section(
-                cls._counter_snapshot_pairs(before_counters, service, labels),
-                cls._counter_snapshot_pairs(after_counters, service, labels),
-            ),
-            "samples": diff_section(
-                cls._sample_snapshot_pairs(before_samples, service, labels),
-                cls._sample_snapshot_pairs(after_samples, service, labels),
-            ),
-            "spans": diff_section(
-                cls._span_snapshot_pairs(before_spans, service, status),
-                cls._span_snapshot_pairs(after_spans, service, status),
-            ),
-        }
+        # 统计重算阶段若仍遇到转换失败（如不可复现的自定义 __float__），
+        # 同样归为 SnapshotFormatError，不向外泄漏其他异常类型。
+        try:
+            result = {
+                "counters": diff_section(
+                    cls._counter_snapshot_pairs(before_counters, service, labels),
+                    cls._counter_snapshot_pairs(after_counters, service, labels),
+                ),
+                "samples": diff_section(
+                    cls._sample_snapshot_pairs(before_samples, service, labels),
+                    cls._sample_snapshot_pairs(after_samples, service, labels),
+                ),
+                "spans": diff_section(
+                    cls._span_snapshot_pairs(before_spans, service, status),
+                    cls._span_snapshot_pairs(after_spans, service, status),
+                ),
+            }
+        except ValueError as exc:
+            raise SnapshotFormatError(str(exc))
         # 再深拷贝一次切断与解析中间结构的引用（条目本身已是新建对象，
         # 这里保证容器层级同样全新独立，且结果严格可 JSON 序列化）。
         return copy.deepcopy(result)
@@ -1312,15 +1322,12 @@ class Telemetry:
 
     @staticmethod
     def _restore_sample_value(value):
-        # 与 observe 相同的有限数值规则，原值保留。
+        # 与 observe 相同的有限数值规则，原值保留；超大整数溢出、自定义
+        # __float__ 异常等底层转换错误一律归为 SnapshotFormatError。
         try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            raise SnapshotFormatError("sample value must be numeric")
-        if math.isnan(numeric) or math.isinf(numeric):
-            raise SnapshotFormatError(
-                "sample value must be finite, got %r" % (value,)
-            )
+            Telemetry._finite_float(value)
+        except ValueError as exc:
+            raise SnapshotFormatError(str(exc))
         return value
 
     @classmethod
@@ -1369,8 +1376,13 @@ class Telemetry:
                 raise SnapshotFormatError("duplicate sample record")
             if checked:
                 # 统计一律按公开浮点规则从 values 重算；输入中存在的
-                # 统计字段必须与重算结果一致。
-                stats = cls._sample_stats(checked)
+                # 统计字段必须与重算结果一致。重算时的转换失败同样归为
+                # SnapshotFormatError，不向外泄漏 ValueError 以外的类型，
+                # 也不让底层异常绕过快照入口的统一异常契约。
+                try:
+                    stats = cls._sample_stats(checked)
+                except ValueError as exc:
+                    raise SnapshotFormatError(str(exc))
                 for stat_key in cls._STATS_KEYS:
                     if stat_key in record:
                         given = cls._restore_json_strict(
