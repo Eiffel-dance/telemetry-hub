@@ -830,7 +830,7 @@ class Telemetry:
     # ------------------------------------------------------------------
 
     @classmethod
-    def diff_snapshots(cls, before, after):
+    def diff_snapshots(cls, before, after, service=None, labels=None, status=None):
         """只读比较两份离线快照，返回 added/removed/changed 差异字典。
 
         两个输入都接受 snapshot() 返回的字典、json() 产生的 JSON 文本或
@@ -838,6 +838,17 @@ class Telemetry:
         重复记录、标签与可哈希标识规则解析，任一输入无效统一抛 ValueError，
         且在抛出前不返回任何结果、不修改输入对象。查询纯只读：不读取 clock、
         不联网、不改变任何输入。
+
+        service/labels/status 是可选的同口径筛选，语义与 snapshot 完全一致：
+        全部省略时与两参数调用逐项一致；service 缺省匹配全部服务，提供时
+        只能是字符串（空字符串表示默认服务）；labels 缺省匹配全部标签，
+        提供时沿用 observe 的成对输入、键排序、重复键与严格 JSON 校验，
+        按归一化后的完整标签集合与计数器/样本精确匹配，不作用于跨度；
+        status 缺省匹配全部跨度，提供时只接受 open/closed/error 且只作用
+        于跨度，计数器与样本仍按原规则参与比较。任一筛选非法都在解析输入
+        前抛 ValueError。before 与 after 各自先完成完整快照解析与严格校验，
+        再独立应用同一组筛选，最后按既有定位键生成差异：筛选导致某条跨度
+        只在一侧可见时，按筛选后的视图判定 added 或 removed。
 
         返回全新的、可 JSON 序列化的字典，顶层只有 counters、samples、spans，
         每一项都只含 added、removed、changed 三个数组。counter/sample 以
@@ -850,6 +861,13 @@ class Telemetry:
         自快照的稳定排序，changed 按 after 记录的快照排序；无差异对应数组
         为空。返回的记录与嵌套标签均可安全修改，与两个输入互不共享。
         """
+        # 筛选先校验、归一化，之后才解析输入，保证非法筛选不产生部分结果；
+        # 整个过程纯只读，不调用 clock。
+        service = cls._filter_service(service)
+        status = cls._filter_status(status)
+        if labels is not None:
+            labels = cls._normalize_labels(labels)
+
         before_data = cls._restore_parse(before)
         # 两边先全部解析并校验完成，之后才构造任何差异输出：任一输入无效
         # 都不会返回部分结果。
@@ -887,18 +905,20 @@ class Telemetry:
 
         before_counters, before_samples, before_spans = before_state
         after_counters, after_samples, after_spans = after_state
+        # 两侧在校验后的完整状态上独立应用同一组筛选：service 对三个分区
+        # 同时生效，labels 只作用于计数器/样本，status 只作用于跨度。
         result = {
             "counters": diff_section(
-                cls._counter_snapshot_pairs(before_counters),
-                cls._counter_snapshot_pairs(after_counters),
+                cls._counter_snapshot_pairs(before_counters, service, labels),
+                cls._counter_snapshot_pairs(after_counters, service, labels),
             ),
             "samples": diff_section(
-                cls._sample_snapshot_pairs(before_samples),
-                cls._sample_snapshot_pairs(after_samples),
+                cls._sample_snapshot_pairs(before_samples, service, labels),
+                cls._sample_snapshot_pairs(after_samples, service, labels),
             ),
             "spans": diff_section(
-                cls._span_snapshot_pairs(before_spans),
-                cls._span_snapshot_pairs(after_spans),
+                cls._span_snapshot_pairs(before_spans, service, status),
+                cls._span_snapshot_pairs(after_spans, service, status),
             ),
         }
         # 再深拷贝一次切断与解析中间结构的引用（条目本身已是新建对象，
