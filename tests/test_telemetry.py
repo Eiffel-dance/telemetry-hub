@@ -666,6 +666,271 @@ class TelemetryTraceTest(unittest.TestCase):
             self.assertEqual(node[field], entry[field])
 
 
+class TelemetrySpanLabelsTest(unittest.TestCase):
+    """跨度标签维度：start 接受可选 labels，沿用 observe 的规范化与严格
+    JSON 约束；标签在跨度开始时确定，查询/快照/追踪/恢复/合并/差异
+    均携带并按标签定位。"""
+
+    def build(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("a", labels=(("b", 2), ("a", 1)))       # 0，默认服务有标签
+        t.start("b")                                     # 1，默认服务无标签
+        t.start("c", service="api", labels=(("a", 1), ("b", 2)))  # 2，同标签
+        t.start("d", service="api", labels=(("k", "v"),))         # 3
+        t.finish("d", service="api", error="boom")     # 4
+        return t
+
+    def test_start_normalizes_labels_and_does_not_mutate_input(self):
+        t = Telemetry(iter(range(100)).__next__)
+        labels = [("b", 2), ("a", [1, {"x": 2}])]
+        t.start("s", labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", [1, {"x": 2}])])
+        entry = t.query("open")[0]
+        self.assertEqual(entry["labels"], [("a", [1, {"x": 2}]), ("b", 2)])
+        # 返回的标签可安全修改，与聚合器互不共享
+        entry["labels"][0][1].append(999)
+        self.assertEqual(
+            t.query("open")[0]["labels"], [("a", [1, {"x": 2}]), ("b", 2)]
+        )
+        # 无标签跨度保持既有六字段形状
+        t.start("plain")
+        self.assertEqual(
+            set(t.query("open", labels=())[0]),
+            {"span", "service", "parent", "start", "end", "error"},
+        )
+
+    def test_start_invalid_labels_rejected_without_clock_or_partial_state(self):
+        reads = []
+        t = Telemetry(lambda: reads.append(1) or 0.0)
+        for bad in (
+            (("k", 1), ("k", 2)),       # 重复键
+            (("v", object()),),         # 不可序列化
+            (("v", float("nan")),),     # NaN
+            (("v", {"b": 1, "a": 2}), ("v", {"a": 1})),  # 非成对结构
+        ):
+            with self.assertRaises(ValueError):
+                t.start("s", labels=bad)
+        self.assertEqual(reads, [])
+        self.assertEqual(t.snapshot()["spans"], [])
+
+    def test_span_identity_ignores_labels_and_finish_keeps_them(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("s", labels=(("k", "v"),))
+        # 跨度仍由 service 与 span 唯一标识：不同标签的重复开始同样拒绝
+        with self.assertRaises(ValueError):
+            t.start("s", labels=(("other", 1),))
+        with self.assertRaises(ValueError):
+            t.start("s")
+        t.finish("s", error="boom")
+        entry = t.query("error")[0]
+        self.assertEqual(entry["labels"], [("k", "v")])
+        self.assertEqual(entry["error"], "boom")
+        # 已结束跨度也不能以新标签重新开始
+        with self.assertRaises(ValueError):
+            t.start("s", labels=(("x", 1),))
+
+    def test_query_labels_filter(self):
+        t = self.build()
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("open", labels=(("a", 1), ("b", 2)))],
+            [("", "a"), ("api", "c")],
+        )
+        # 输入顺序不影响归一化匹配
+        self.assertEqual(
+            t.query("open", labels=(("b", 2), ("a", 1))),
+            t.query("open", labels=(("a", 1), ("b", 2))),
+        )
+        # 显式空标签只命中无标签跨度；省略筛选匹配全部
+        self.assertEqual([e["span"] for e in t.query("open", labels=())], ["b"])
+        self.assertEqual(len(t.query("open")), 3)
+        self.assertEqual(t.query("open", labels=(("z", 1),)), [])
+        # 标签筛选与状态、服务筛选组合
+        self.assertEqual(
+            [e["span"] for e in t.query("error", service="api", labels=(("k", "v"),))],
+            ["d"],
+        )
+        # 非法筛选在读取跨度前拒绝，不读 clock、不改状态
+        before = t.snapshot()
+        t.clock = lambda: (_ for _ in ()).throw(AssertionError("no clock"))
+        for bad in ((("k", 1), ("k", 2)), (("v", object()),), 42, "k"):
+            with self.assertRaises(ValueError):
+                t.query("open", labels=bad)
+        t.clock = iter(range(100, 200)).__next__
+        self.assertEqual(t.snapshot(), before)
+
+    def test_snapshot_and_json_labels_filter_applies_to_spans(self):
+        t = self.build()
+        hit = t.snapshot(labels=(("a", 1), ("b", 2)))["spans"]
+        self.assertEqual([x["span"] for x in hit], ["a", "c"])
+        self.assertEqual(hit[0]["labels"], [("a", 1), ("b", 2)])
+        self.assertEqual([x["span"] for x in t.snapshot(labels=())["spans"]], ["b"])
+        self.assertEqual(t.snapshot(labels=(("z", 1),))["spans"], [])
+        # 省略筛选时与既有行为一致；无标签条目无 labels 字段
+        for record in t.snapshot()["spans"]:
+            if record["span"] == "b":
+                self.assertNotIn("labels", record)
+        labeled = json.loads(t.json(labels=(("k", "v"),)))["spans"]
+        self.assertEqual(labeled[0]["labels"], [["k", "v"]])
+        self.assertEqual(
+            t.json(labels=(("a", 1), ("b", 2))),
+            json.dumps(
+                t.snapshot(labels=(("a", 1), ("b", 2))),
+                sort_keys=True, separators=(",", ":"),
+            ),
+        )
+
+    def test_trace_nodes_carry_safe_labels(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("root", labels=(("env", "prod"),))
+        t.start("child", parent="root", labels=(("env", "dev"),))
+        t.start("plain", parent="root")
+        tree = t.trace("root")
+        self.assertEqual(tree["labels"], [("env", "prod")])
+        self.assertEqual(
+            [c["span"] for c in tree["children"]], ["child", "plain"]
+        )
+        self.assertEqual(tree["children"][0]["labels"], [("env", "dev")])
+        self.assertNotIn("labels", tree["children"][1])
+        # 修改返回的标签不影响聚合器
+        tree["labels"].append(("x", 1))
+        tree["children"][0]["labels"].append(("x", 1))
+        again = t.trace("root")
+        self.assertEqual(again["labels"], [("env", "prod")])
+        self.assertEqual(again["children"][0]["labels"], [("env", "dev")])
+
+    def test_snapshot_roundtrip_and_legacy_snapshot_without_labels(self):
+        t = self.build()
+        self.assertEqual(Telemetry.from_snapshot(t.snapshot()).snapshot(), t.snapshot())
+        self.assertEqual(Telemetry.restore(t.json()).json(), t.json())
+        # 缺少 labels 的旧快照按空标签恢复，重新导出保持既有字段形状
+        legacy = {"counters": [], "samples": [], "spans": [
+            {"span": "s", "service": "", "parent": None,
+             "start": 0, "end": None, "error": None},
+        ]}
+        restored = Telemetry.restore(legacy)
+        self.assertEqual(restored.snapshot(), legacy)
+        # 显式空 labels 与缺失等价
+        with_empty = {"counters": [], "samples": [], "spans": [
+            {"span": "s", "service": "", "parent": None,
+             "start": 0, "end": None, "error": None, "labels": []},
+        ]}
+        self.assertEqual(Telemetry.restore(with_empty).snapshot(), legacy)
+
+    def test_restore_rejects_bad_span_labels_atomically(self):
+        base = {"span": "s", "service": "", "parent": None,
+                "start": 0, "end": None, "error": None}
+        for bad_labels in (
+            [["k", 1], ["k", 2]],        # 重复键
+            [["k", float("nan")]],       # 非严格 JSON
+            "nope",                      # 非数组
+            [["k"]],                     # 非成对
+            [[object(), 1]],             # 不可序列化键
+        ):
+            payload = {"counters": [], "samples": [],
+                       "spans": [dict(base, labels=bad_labels)]}
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad_labels)):
+                Telemetry.from_snapshot(payload)
+            t = Telemetry()
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad_labels)):
+                t.restore_snapshot(payload)
+            self.assertEqual(
+                t.snapshot(), {"counters": [], "samples": [], "spans": []}
+            )
+        # 未知多余字段仍然拒绝
+        payload = {"counters": [], "samples": [],
+                   "spans": [dict(base, labels=[], extra=1)]}
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.restore(payload)
+
+    def test_merge_label_conflict_fails_atomically(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("c")
+        t.start("s", labels=(("k", "v"),))
+        before = t.snapshot()
+        conflict = {"counters": [{"service": "", "name": "c2",
+                                  "labels": [], "value": 1}],
+                    "samples": [], "spans": [
+                        {"span": "s", "service": "", "parent": None,
+                         "start": 0, "end": None, "error": None,
+                         "labels": [["k", "other"]]}]}
+        with self.assertRaises(ValueError):
+            t.merge_snapshot(conflict)
+        self.assertEqual(t.snapshot(), before)  # 计数器累加一并撤销
+        # 标签完全一致时幂等
+        t.merge_snapshot({"counters": [], "samples": [], "spans": [
+            {"span": "s", "service": "", "parent": None,
+             "start": 0, "end": None, "error": None,
+             "labels": [["k", "v"]]}]})
+        self.assertEqual(t.snapshot(), before)
+        # 一方无标签、一方有标签同样冲突
+        plain = Telemetry(iter(range(100)).__next__)
+        plain.start("s")
+        with self.assertRaises(ValueError):
+            plain.merge_snapshot(t.snapshot())
+
+    def test_diff_labels_change_counts_as_changed_and_filter_applies(self):
+        head = {"counters": [], "samples": []}
+        unlabeled = {"span": "s", "service": "", "parent": None,
+                     "start": 0, "end": None, "error": None}
+        labeled = dict(unlabeled, labels=[["k", "v"]])
+        d = Telemetry.diff_snapshots(
+            dict(head, spans=[unlabeled]), dict(head, spans=[labeled])
+        )
+        self.assertEqual(len(d["spans"]["changed"]), 1)
+        self.assertEqual(d["spans"]["added"], [])
+        self.assertEqual(d["spans"]["removed"], [])
+        self.assertEqual(d["spans"]["changed"][0]["after"]["labels"],
+                         [("k", "v")])
+        # labels 筛选作用于跨度：按筛选后的视图判定 added/removed
+        d2 = Telemetry.diff_snapshots(
+            dict(head, spans=[unlabeled]), dict(head, spans=[labeled]),
+            labels=(("k", "v"),),
+        )
+        self.assertEqual([x["span"] for x in d2["spans"]["added"]], ["s"])
+        self.assertEqual(d2["spans"]["removed"], [])
+        d3 = Telemetry.diff_snapshots(
+            dict(head, spans=[unlabeled]), dict(head, spans=[labeled]),
+            labels=(),
+        )
+        self.assertEqual([x["span"] for x in d3["spans"]["removed"]], ["s"])
+        self.assertEqual(d3["spans"]["added"], [])
+
+    def test_batch_start_carries_labels_and_stays_atomic(self):
+        events = [
+            {"op": "start", "span": "root", "labels": (("b", 2), ("a", 1))},
+            {"op": "start", "span": "child", "parent": "root",
+             "labels": (("k", "v"),)},
+            {"op": "finish", "span": "child"},
+        ]
+        bat = Telemetry(iter(range(100)).__next__)
+        self.assertIsNone(bat.batch(copy.deepcopy(events)))
+        seq = Telemetry(iter(range(100)).__next__)
+        seq.start("root", labels=(("a", 1), ("b", 2)))
+        seq.start("child", parent="root", labels=(("k", "v"),))
+        seq.finish("child")
+        self.assertEqual(bat.snapshot(), seq.snapshot())
+        self.assertEqual(bat.trace("root"), seq.trace("root"))
+        # finish 事件不接受 labels 字段
+        with self.assertRaises(ValueError):
+            Telemetry().batch([
+                {"op": "start", "span": "s"},
+                {"op": "finish", "span": "s", "labels": ()},
+            ])
+        # 非法标签整批拒绝，不读 clock、不留状态
+        reads = []
+        t = Telemetry(lambda: reads.append(1) or 0.0)
+        with self.assertRaises(ValueError):
+            t.batch([
+                {"op": "inc", "name": "c"},
+                {"op": "start", "span": "s",
+                 "labels": (("k", 1), ("k", 2))},
+            ])
+        self.assertEqual(reads, [])
+        self.assertEqual(
+            t.snapshot(), {"counters": [], "samples": [], "spans": []}
+        )
+
+
 class TelemetryBatchTest(unittest.TestCase):
     def _events(self):
         return [
@@ -929,11 +1194,10 @@ class TelemetrySnapshotFilterTest(unittest.TestCase):
         self.assertEqual(lab["samples"], [])
         # 输入顺序不同、归一化后相同 -> 精确命中同一集合
         self.assertEqual(t.snapshot(labels=(("b", 2), ("a", 1))), lab)
-        # 标签筛选不限制跨度
-        self.assertEqual(
-            t.snapshot(labels=(("a", 1), ("b", 2)))["spans"],
-            t.snapshot()["spans"],
-        )
+        # 标签筛选同样作用于跨度：build 中的跨度都无标签，
+        # 非空标签筛选不命中任何跨度，显式空标签命中全部无标签跨度
+        self.assertEqual(t.snapshot(labels=(("a", 1), ("b", 2)))["spans"], [])
+        self.assertEqual(t.snapshot(labels=())["spans"], t.snapshot()["spans"])
         # 显式空标签只命中无标签记录
         no_lab = t.snapshot(labels=())
         self.assertTrue(all(c["labels"] == [] for c in no_lab["counters"]))
