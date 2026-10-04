@@ -118,6 +118,104 @@ class TelemetryBehaviorTest(unittest.TestCase):
                 t.query(bad)
         self.assertEqual(t.query("error"), t.query("error"))
 
+    def test_span_query_service_filter(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("d1")          # 默认服务，open
+        t.start("d2")
+        t.finish("d2")         # 默认服务，closed 无异常
+        t.start("d3")
+        t.finish("d3", error="bad")  # 默认服务，error
+        t.start("a1", service="api")  # open
+        t.start("a2", service="api")
+        t.finish("a2", service="api")  # closed 无异常
+        t.start("w1", service="web")
+        t.finish("w1", service="web", error=0)  # 假值异常也算 error
+
+        # 省略筛选与显式 None 都与既有 query(status) 逐项一致。
+        for status in ("open", "closed", "error"):
+            self.assertEqual(t.query(status), t.query(status, None))
+            self.assertEqual(t.query(status), t.query(status, service=None))
+
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("open", service="api")],
+            [("api", "a1")],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.query("closed", service="api")],
+            ["a2"],
+        )
+        # 服务内无匹配返回空列表；web 没有 open 跨度。
+        self.assertEqual(t.query("open", service="web"), [])
+        self.assertIsInstance(t.query("error", service="api"), list)
+        # 空字符串表示默认服务，0 这类假值 error 仍按 error 定义命中。
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in t.query("open", service="")],
+            [("", "d1")],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.query("closed", service="")],
+            ["d2", "d3"],
+        )
+        self.assertEqual(
+            [(e["span"], e["error"]) for e in t.query("error", service="")],
+            [("d3", "bad")],
+        )
+        self.assertEqual(
+            [(e["span"], e["error"]) for e in t.query("error", service="web")],
+            [("w1", 0)],
+        )
+        # 不存在的服务一律空列表，记录字段保持六个既有字段。
+        self.assertEqual(t.query("closed", service="missing"), [])
+        self.assertEqual(
+            set(t.query("closed", service="api")[0]),
+            {"span", "service", "parent", "start", "end", "error"},
+        )
+        # 带筛选结果与同口径 snapshot 完全一致（含排序与记录内容）。
+        for status in ("open", "closed", "error"):
+            for service in (None, "", "api", "web", "missing"):
+                self.assertEqual(
+                    t.query(status, service=service),
+                    t.snapshot(status=status, service=service)["spans"],
+                )
+
+    def test_span_query_service_filter_validation_and_isolation(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("a", service="api")
+        t.finish("a", service="api", error=["e"])
+        before = t.snapshot()
+
+        # service 只接受字符串或 None；status 非法时即使带服务筛选也拒绝。
+        for bad in (0, 1, b"api", ["api"], ("api",), object()):
+            with self.assertRaises(ValueError):
+                t.query("open", bad)
+            with self.assertRaises(ValueError):
+                t.query("open", service=bad)
+        for bad in ("OPEN", "", None, 0, [], object()):
+            with self.assertRaises(ValueError):
+                t.query(bad, service="api")
+        # 任何拒绝都不改动聚合状态，且查询不读取 clock。
+        self.assertEqual(t.snapshot(), before)
+
+        def fail_clock():
+            raise AssertionError("query must not read clock")
+
+        t.clock = fail_clock
+        for status in ("open", "closed", "error"):
+            t.query(status, service="api")
+        with self.assertRaises(ValueError):
+            t.query("bad", service="api")
+        with self.assertRaises(ValueError):
+            t.query("open", service=1)
+
+        # 返回记录与内部状态及同次其他记录互不共享。
+        first = t.query("error", service="api")
+        second = t.query("error", service="api")
+        self.assertIsNot(first[0], second[0])
+        first[0]["error"].append("mutated")
+        self.assertEqual(t.query("error", service="api")[0]["error"], ["e"])
+        first[0]["span"] = "hacked"
+        self.assertEqual(t.query("error", service="api")[0]["span"], "a")
+
     def test_span_service_locator_and_parent(self):
         t = Telemetry(iter(range(100)).__next__)
         t.start("same", parent="p-default")
