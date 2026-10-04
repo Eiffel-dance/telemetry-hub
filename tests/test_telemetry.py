@@ -1619,5 +1619,112 @@ class TelemetryRestoreResumeTest(unittest.TestCase):
         )
 
 
+class TelemetrySpanResultIsolationTest(unittest.TestCase):
+    """只读跨度结果的可变值别名隔离：query/snapshot/trace 返回的记录、
+    parent 与 error 中的可变容器必须与内部状态及同次结果的其他记录
+    互不共享；异常与自定义对象保持入口的原值语义。"""
+
+    def build(self):
+        clock = iter(range(100)).__next__
+        t = Telemetry(clock)
+        t.start("a", parent=["root", {"tag": [1, 2]}])
+        t.start("b", parent=["root", {"tag": [1, 2]}])
+        t.finish("a", error={"code": [1, 2]})
+        t.start("s1", service="api", parent={"p": ["q"]})
+        t.finish("s1", service="api", error=["boom", {"k": "v"}])
+        t.start("open1", parent=["o"])
+        return t
+
+    def test_query_records_do_not_alias_internal_state(self):
+        t = self.build()
+        before = t.json()
+        for rec in t.query("closed"):
+            if isinstance(rec["error"], dict):
+                rec["error"]["code"].append(999)
+            if isinstance(rec["error"], list):
+                rec["error"].append("x")
+            if isinstance(rec["parent"], dict):
+                rec["parent"]["p"].append("x")
+        for rec in t.query("open"):
+            rec["parent"].append("x")
+        self.assertEqual(t.query("open")[0]["parent"], ["root", {"tag": [1, 2]}])
+        self.assertEqual(t.query("error")[0]["error"], {"code": [1, 2]})
+        self.assertEqual(t.query("error")[1]["error"], ["boom", {"k": "v"}])
+        self.assertEqual(t.json(), before)  # JSON 输出不受影响
+
+    def test_snapshot_records_do_not_alias_internal_state(self):
+        t = self.build()
+        before = t.json()
+        snap = t.snapshot()
+        for rec in snap["spans"]:
+            if isinstance(rec["parent"], list):
+                rec["parent"].append("S")
+            if isinstance(rec["error"], dict):
+                rec["error"]["code"] = []
+        self.assertEqual(t.snapshot(), self.build().snapshot())
+        self.assertEqual(t.json(), before)
+
+    def test_same_result_records_do_not_share_containers(self):
+        t = Telemetry(iter(range(100)).__next__)
+        shared = ["shared"]
+        t.start("x", parent=shared)
+        t.start("y", parent=shared)
+        result = t.query("open")
+        result[0]["parent"].append("ONE")
+        self.assertEqual(result[1]["parent"], ["shared"])
+        self.assertEqual(t.query("open")[0]["parent"], ["shared"])
+
+    def test_trace_tree_does_not_alias_internal_state(self):
+        t = self.build()
+        before = t.json()
+        node = t.trace("b")
+        node["parent"].append("T")
+        node["children"].append("junk")
+        api = t.trace("s1", service="api")
+        api["error"].append("T")
+        api["parent"]["p"].append("T")
+        self.assertEqual(t.trace("b")["parent"], ["root", {"tag": [1, 2]}])
+        self.assertEqual(
+            t.trace("s1", service="api")["error"], ["boom", {"k": "v"}]
+        )
+        self.assertEqual(t.json(), before)
+
+    def test_uncopyable_objects_keep_original_value_semantics(self):
+        class Uncopyable:
+            def __deepcopy__(self, memo):
+                raise RuntimeError("nope")
+
+            def __copy__(self):
+                raise RuntimeError("nope")
+
+        t = Telemetry(iter(range(100)).__next__)
+        marker = Uncopyable()
+        t.start("u", parent=[marker, {"a": 1}])
+        t.finish("u", error=marker)
+        rec = t.query("closed")[0]
+        self.assertIs(rec["error"], marker)  # 不可复制对象原值返回
+        self.assertIs(rec["parent"][0], marker)
+        rec["parent"].append("Z")  # 容器本身仍与内部状态隔离
+        rec["parent"][1]["a"] = 9
+        self.assertEqual(t.query("closed")[0]["parent"], [marker, {"a": 1}])
+        node = t.trace("u")  # trace 不因不可复制对象新增拒绝
+        self.assertIs(node["error"], marker)
+
+    def test_restored_and_merged_spans_are_isolated(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.start("root")
+        t.start("child", parent="root")
+        t.finish("child", error={"code": [1]})
+        restored = Telemetry.restore(t.json(), clock=iter(range(100)).__next__)
+        rec = restored.query("closed")[0]
+        rec["error"]["code"].append(9)
+        self.assertEqual(restored.query("closed")[0]["error"], {"code": [1]})
+        merged = Telemetry(iter(range(100)).__next__)
+        merged.merge_snapshot(t.snapshot())
+        rec = merged.query("closed")[0]
+        rec["error"]["code"].append(9)
+        self.assertEqual(merged.query("closed")[0]["error"], {"code": [1]})
+
+
 if __name__ == "__main__":
     unittest.main()

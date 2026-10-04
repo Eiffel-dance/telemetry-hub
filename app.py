@@ -107,6 +107,42 @@ def _thaw_labels(labels):
     return [(key, _thaw_json(value)) for key, value in labels]
 
 
+def _isolate_mutable(value, _memo=None):
+    """把只读结果中的可变容器重建为与内部状态互不共享的新结构。
+
+    列表、字典、元组、集合与 bytearray 逐层复制：同一子结构经 memo
+    只复制一次，自引用拓扑保持不变；标量、异常实例与自定义对象一律
+    原样返回——隔离只针对容器，不为不可复制的对象新增任何拒绝条件，
+    入口的原值语义不变。
+    """
+    if not isinstance(value, (list, dict, tuple, set, frozenset, bytearray)):
+        return value
+    if _memo is None:
+        _memo = {}
+    copied = _memo.get(id(value))
+    if copied is not None:
+        return copied
+    if isinstance(value, list):
+        copied = []
+        _memo[id(value)] = copied
+        copied.extend(_isolate_mutable(item, _memo) for item in value)
+    elif isinstance(value, dict):
+        copied = {}
+        _memo[id(value)] = copied
+        for key, item in value.items():
+            copied[key] = _isolate_mutable(item, _memo)
+    elif isinstance(value, tuple):
+        copied = tuple(_isolate_mutable(item, _memo) for item in value)
+        _memo[id(value)] = copied
+    elif isinstance(value, bytearray):
+        copied = bytearray(value)
+        _memo[id(value)] = copied
+    else:  # set / frozenset：成员可哈希，按原类型重建
+        copied = type(value)(_isolate_mutable(item, _memo) for item in value)
+        _memo[id(value)] = copied
+    return copied
+
+
 class SnapshotFormatError(ValueError):
     """快照恢复格式错误的公开异常类型。
 
@@ -404,13 +440,17 @@ class Telemetry:
 
     @staticmethod
     def _span_entry(service, span, record):
+        # 只读跨度记录的唯一构造点：每次调用都生成全新字典，parent、
+        # start、end、error 中的可变容器逐层重建——调用方改写返回记录
+        # 或其嵌套容器不会回流到聚合器，同次结果中的记录之间也互不共享；
+        # 标量、异常实例与自定义对象保持入口的原值语义，原样返回。
         return {
             "span": span,
             "service": service,
-            "parent": record["parent"],
-            "start": record["start"],
-            "end": record["end"],
-            "error": record["error"],
+            "parent": _isolate_mutable(record["parent"]),
+            "start": _isolate_mutable(record["start"]),
+            "end": _isolate_mutable(record["end"]),
+            "error": _isolate_mutable(record["error"]),
         }
 
     def _span_entries(self):
@@ -452,8 +492,10 @@ class Telemetry:
         # 也不例外，只有 None（JSON 中为 null）表示正常结束。只接受这三个
         # 字符串，其他字符串、空值、非字符串一律 ValueError；拒绝发生在
         # 读取任何跨度之前，不调用 clock，也不产生部分结果。每条命中都通过
-        # _span_entry 生成独立记录字典，调用方改写返回列表或记录字段不影响
-        # counters/samples/spans；error 原值（含异常实例）原样保留。
+        # _span_entry 生成独立记录字典，其中的可变容器（parent/error 等字段
+        # 里的列表、字典）同样逐层重建，调用方改写返回列表、记录或嵌套容器
+        # 不影响 counters/samples/spans，也不影响同次结果中的其他记录；
+        # error 原值（含异常实例）原样保留。
         if status not in ("open", "error", "closed"):
             raise ValueError("status must be 'open', 'error' or 'closed'")
         result = []
@@ -505,8 +547,9 @@ class Telemetry:
             if key in visited:  # 每个跨度只有一个父标识，重复到达即成环
                 raise ValueError("cycle detected in span parent references")
             visited.add(key)
+            # _span_entry 已生成与聚合器隔离的新记录：节点字典、children
+            # 数组与嵌套可变容器均为全新对象，异常等不可复制对象保持原值。
             node = self._span_entry(service, node_span, node_record)
-            node = copy.deepcopy(node)  # 与聚合器切断一切可变对象共享
             node["children"] = []
             children = [
                 (child_span, self.spans[(service, child_span)])
@@ -623,8 +666,9 @@ class Telemetry:
         改写。任一筛选非法都在读取聚合前抛 ValueError：不调用 clock、不产生
         部分结果；无匹配时对应数组为空。统计只对命中的样本序列按原规则重算，
         排序仍按服务、名称、标签或跨度开始时间、标识的稳定顺序。返回的字典、
-        数组与记录均为独立副本，重复使用同一组筛选结果相同，筛选不写入、清空
-        或重排任何内部数据。
+        数组与记录均为独立副本，跨度记录中 parent/error 等字段的可变容器也
+        逐层重建，与内部状态及同次结果的其他记录互不共享；重复使用同一组筛选
+        结果相同，筛选不写入、清空或重排任何内部数据。
         """
         # 全部筛选先校验、归一化，之后才读取聚合，保证非法筛选不产生部分
         # 结果；整个过程纯只读，不调用 clock。
