@@ -209,9 +209,11 @@ class Telemetry:
     @staticmethod
     def _check_sample_value(value):
         # observe 的样本入站规则：可转 float 且必须有限，原值由调用方保留。
+        # 超大整数等输入在 float() 转换时会抛 OverflowError，与不可转换
+        # 一样属于入站拒绝，统一归并为 ValueError，不泄漏底层异常。
         try:
             numeric = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError("sample value must be numeric")
         if math.isnan(numeric) or math.isinf(numeric):
             raise ValueError("sample value must be finite, got %r" % (value,))
@@ -572,7 +574,10 @@ class Telemetry:
         # 其他数值类型（Decimal、Fraction、字符串等）一律拒绝。
         if isinstance(q, bool) or not isinstance(q, (int, float)):
             raise ValueError("q must be an int or float, got %r" % (q,))
-        if not math.isfinite(q):
+        # 整数必然有限，直接做 isfinite 会让超大整数在 int->float 转换中
+        # 抛 OverflowError；有限性检查只对 float 进行，超大整数随后由
+        # 区间比较（纯整数运算，不会溢出）按超出 [0, 100] 拒绝。
+        if isinstance(q, float) and not math.isfinite(q):
             raise ValueError("q must be finite, got %r" % (q,))
         if q < 0 or q > 100:
             raise ValueError("q must be within [0, 100], got %r" % (q,))
@@ -599,7 +604,12 @@ class Telemetry:
         values = self.samples.get((service, name, labels))
         if not values:  # 键不存在或空序列：无分位数可言
             return None
-        ordered = sorted(float(value) for value in values)
+        # 既有样本按公开浮点规则转换：不可转换或转换溢出（如超大整数）
+        # 与 observe 入站一样统一为 ValueError，不返回部分结果。
+        try:
+            ordered = sorted(float(value) for value in values)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("sample value must be numeric")
         position = (len(ordered) - 1) * q / 100.0
         lower = int(math.floor(position))
         upper = int(math.ceil(position))
@@ -629,7 +639,10 @@ class Telemetry:
                     "histogram boundary must be a non-bool int or float,"
                     " got %r" % (boundary,)
                 )
-            if not math.isfinite(boundary):
+            # 整数必然有限，且分桶比较是精确的 int/float 比较，不需要
+            # 转成 float；只对 float 做有限性检查，避免超大整数在
+            # isfinite 的隐式转换中抛 OverflowError。
+            if isinstance(boundary, float) and not math.isfinite(boundary):
                 raise ValueError(
                     "histogram boundary must be finite, got %r" % (boundary,)
                 )
@@ -673,7 +686,7 @@ class Telemetry:
         for value in values:
             try:
                 number = float(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise ValueError("sample value must be numeric")
             if math.isnan(number) or math.isinf(number):
                 raise ValueError(
@@ -704,7 +717,13 @@ class Telemetry:
 
     @staticmethod
     def _sample_stats(values):
-        floats = [float(value) for value in values]
+        # 统计按 values 写入顺序对公开浮点转换结果重算；既有样本不可转换
+        # 或转换溢出（如超大整数）时与 observe 入站一样统一为 ValueError。
+        # 恢复入口在调用前已用 _restore_sample_value 逐条校验，不会走到这里。
+        try:
+            floats = [float(value) for value in values]
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("sample value must be numeric")
         total = 0.0
         for number in floats:  # 按 values 写入顺序累加
             total += number
@@ -1312,10 +1331,12 @@ class Telemetry:
 
     @staticmethod
     def _restore_sample_value(value):
-        # 与 observe 相同的有限数值规则，原值保留。
+        # 与 observe 相同的有限数值规则，原值保留；超大整数等输入在
+        # float() 转换时抛的 OverflowError 同样归并为 SnapshotFormatError，
+        # 不向恢复入口的调用方泄漏底层异常。
         try:
             numeric = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise SnapshotFormatError("sample value must be numeric")
         if math.isnan(numeric) or math.isinf(numeric):
             raise SnapshotFormatError(
