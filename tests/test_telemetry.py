@@ -4,7 +4,7 @@ import math
 import unittest
 
 import app as appmod
-from app import Telemetry
+from app import Telemetry, SnapshotFormatError, SNAPSHOT_VERSION
 
 
 class TelemetryBehaviorTest(unittest.TestCase):
@@ -1310,6 +1310,359 @@ class TelemetryDiffTest(unittest.TestCase):
         self.assertIsNot(pair["before"], pair["after"])
         pair["before"]["name"] = "x"
         self.assertNotEqual(pair["after"]["name"], "x")
+
+
+class TelemetryRestoreEntryTest(unittest.TestCase):
+    """新增公开恢复入口 restore() 与 SnapshotFormatError 的行为契约。"""
+
+    def build(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("hits", 2, labels=(("b", "2"), ("a", "1")))
+        t.inc("hits", -3, labels=(("键", "值🙂"),), service="服务")
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.observe("lat", "3.5", service="api")
+        t.observe("tiny", 5e-324)
+        t.start("r1")
+        t.finish("r1", error="boom")
+        t.start("r2", service="api", parent="r1")  # 未结束、跨服务父引用
+        return t
+
+    def continuation(self, inst):
+        # 相同的续采事件；恢复实例与全量记录实例收到完全相同的序列。
+        inst.clock = iter([42.0, 43.0, 44.0]).__next__
+        inst.finish("r2", service="api", error="late")
+        inst.inc("hits")
+        inst.observe("lat", 4, service="api")
+        inst.observe("tiny", -0.0)
+        inst.start("r3", parent="r1")
+        inst.finish("r3", error=0)
+
+    def test_exception_is_public_valueerror_subclass(self):
+        self.assertTrue(issubclass(SnapshotFormatError, ValueError))
+        self.assertTrue(issubclass(SnapshotFormatError, Exception))
+        self.assertEqual(SNAPSHOT_VERSION, 1)
+
+    def test_accepts_dict_text_bytes_and_versioned_empty(self):
+        t = self.build()
+        text = t.json()
+        variants = (t.snapshot(), text, text.encode("utf-8"))
+        for raw in variants:
+            r = Telemetry()
+            self.assertIsNone(r.restore(raw))
+            self.assertEqual(r.snapshot(), t.snapshot())
+            self.assertEqual(r.json(), text)
+        # 空快照（含显式 version 形式）得到可继续使用的空聚合器
+        for empty in (
+            {"counters": [], "samples": [], "spans": []},
+            '{"counters":[],"samples":[],"spans":[]}',
+            {"counters": [], "samples": [], "spans": [], "version": 1},
+            {"counters": [], "samples": [], "spans": [], "version": 1.0},
+        ):
+            r = Telemetry()
+            r.restore(empty)
+            self.assertEqual(r.snapshot(), {"counters": [], "samples": [], "spans": []})
+            r.inc("x")
+            r.observe("y", 0.0)
+            r.start("s")
+            r.finish("s")
+            self.assertEqual(r.snapshot()["counters"][0]["value"], 1)
+
+    def test_continuation_matches_full_event_sequence(self):
+        text = self.build().json()
+
+        full = self.build()
+        self.continuation(full)
+
+        restored = Telemetry(iter(range(1000)).__next__)
+        restored.restore(text)
+        self.continuation(restored)
+
+        # 快照字段值、浮点统计与稳定排序逐项一致
+        self.assertEqual(restored.snapshot(), full.snapshot())
+        self.assertEqual(restored.json(), full.json())
+        for status in ("open", "closed", "error"):
+            self.assertEqual(restored.query(status), full.query(status))
+        self.assertEqual(restored.trace("r1"), full.trace("r1"))
+        self.assertEqual(
+            restored.percentile("lat", 50, service="api"),
+            full.percentile("lat", 50, service="api"),
+        )
+        # 负增量已累加、极小浮点结果不变
+        counter = [
+            c for c in restored.snapshot()["counters"]
+            if c["service"] == "服务" and c["name"] == "hits"
+        ][0]
+        self.assertEqual(counter["value"], -3)
+        tiny = [s for s in restored.snapshot()["samples"] if s["name"] == "tiny"][0]
+        self.assertEqual(tiny["values"], [5e-324, -0.0])
+        self.assertEqual(tiny["minimum"], -0.0)
+        self.assertEqual(tiny["maximum"], 5e-324)
+
+    def test_two_restored_instances_continue_byte_identically(self):
+        text = self.build().json()
+        a = Telemetry(iter(range(10)).__next__)
+        b = Telemetry(iter(range(10)).__next__)
+        a.restore(text)
+        b.restore(text)
+        self.continuation(a)
+        self.continuation(b)
+        self.assertEqual(a.snapshot(), b.snapshot())
+        self.assertEqual(a.json(), b.json())  # 逐字一致
+        self.assertEqual(a.query("error"), b.query("error"))
+
+    def test_open_and_error_spans_visible_and_finish_isolated(self):
+        t = self.build()
+        r = Telemetry()
+        r.restore(t.json())
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in r.query("open")],
+            [("api", "r2")],
+        )
+        errored = r.query("error")
+        self.assertEqual([(e["service"], e["span"]) for e in errored], [("", "r1")])
+        self.assertEqual(errored[0]["error"], "boom")
+        # 结束一个跨度只更新它本身，不隐式结束其他跨度
+        r.clock = iter([7.0]).__next__
+        r.finish("r2", service="api", error="late")
+        self.assertEqual(r.query("open"), [])
+        self.assertEqual(
+            [(e["service"], e["span"]) for e in r.query("error")],
+            [("", "r1"), ("api", "r2")],
+        )
+        r2 = [e for e in r.query("closed") if e["span"] == "r2"][0]
+        self.assertEqual(r2["end"], 7.0)
+        self.assertEqual(r2["parent"], "r1")
+        r1 = [e for e in r.query("closed") if e["span"] == "r1"][0]
+        self.assertNotEqual(r1["end"], 7.0)
+        # 已结束跨度不能二次结束，生命周期语义沿用既有入口
+        with self.assertRaises(ValueError):
+            r.finish("r2", service="api")
+        with self.assertRaises(ValueError):
+            r.start("r2", service="api")
+
+    def test_restore_replaces_state_atomically(self):
+        t = Telemetry(iter(range(10)).__next__)
+        t.inc("old", 99)
+        t.start("olds")
+        before = t.snapshot()
+        # 成功恢复是整体替换而非合并
+        t.restore({"counters": [], "samples": [], "spans": []})
+        self.assertEqual(t.snapshot(), {"counters": [], "samples": [], "spans": []})
+        # 再次放入数据后，任何失败都必须保持状态完全不变
+        t = Telemetry(iter(range(10)).__next__)
+        t.inc("old", 99)
+        t.start("olds")
+        before = t.snapshot()
+        for bad in (
+            "{not json",
+            b"\xff bad",
+            {"counters": [], "samples": []},
+            {"counters": [], "samples": [], "spans": [], "extra": 1},
+            {"counters": {}, "samples": [], "spans": []},
+        ):
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad)):
+                t.restore(bad)
+            self.assertEqual(t.snapshot(), before, msg=repr(bad))
+            self.assertEqual([e["span"] for e in t.query("open")], ["olds"])
+
+    def test_version_validation(self):
+        empty = {"counters": [], "samples": [], "spans": []}
+        supported = (1, 1.0)
+        for version in supported:
+            Telemetry().restore(dict(empty, version=version))
+        for bad in (0, 2, -1, "1", None, True, 1.5, float("inf"), [], {}):
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad)):
+                Telemetry().restore(dict(empty, version=bad))
+
+    def test_malformed_payloads_raise_snapshot_format_error(self):
+        good_span = {"span": "a", "service": "", "parent": None,
+                     "start": 0, "end": None, "error": None}
+        cases = [
+            "{not json}",
+            b"\xff not utf-8",
+            42,
+            None,
+            [1, 2],
+            json.dumps({"counters": [], "samples": []}),
+            json.dumps(dict({"counters": [], "samples": [], "spans": []}, x=1)),
+            '{"counters":[],"counters":[],"samples":[],"spans":[]}',
+            '{"counters":[],"samples":[],"spans":[],"x":NaN}',
+            {"counters": {}, "samples": [], "spans": []},
+            {"counters": [], "samples": {}, "spans": []},
+            {"counters": [], "samples": [], "spans": {}},
+            # 缺必需字段 / 多余字段
+            {"counters": [{"service": "", "name": "c", "labels": []}],
+             "samples": [], "spans": []},
+            {"counters": [{"service": "", "name": "c", "labels": [], "z": 1}],
+             "samples": [], "spans": []},
+            # 服务类型错误
+            {"counters": [{"service": 1, "name": "c", "labels": [], "value": 1}],
+             "samples": [], "spans": []},
+            # 标签无法规范化：重复键、NaN 值
+            {"counters": [{"service": "", "name": "c",
+                           "labels": [["k", 1], ["k", 2]], "value": 1}],
+             "samples": [], "spans": []},
+            {"counters": [{"service": "", "name": "c",
+                           "labels": [["k", float("nan")]], "value": 1}],
+             "samples": [], "spans": []},
+            # 样本非有限值
+            {"counters": [],
+             "samples": [{"service": "", "name": "m", "labels": [],
+                          "values": [float("inf")]}],
+             "spans": []},
+            # 跨度标识不可哈希 / 不可表示
+            {"counters": [], "samples": [],
+             "spans": [dict(good_span, span=["unhashable"])]},
+            {"counters": [], "samples": [],
+             "spans": [dict(good_span, error=object())]},
+            # 重复跨度标识
+            {"counters": [], "samples": [], "spans": [dict(good_span), dict(good_span)]},
+        ]
+        t = Telemetry(iter(range(10)).__next__)
+        t.inc("keep")
+        before = t.snapshot()
+        for index, payload in enumerate(cases):
+            with self.assertRaises(SnapshotFormatError, msg="case %d" % index):
+                t.restore(payload)
+            # 原聚合器状态完全不变
+            self.assertEqual(t.snapshot(), before, msg="case %d" % index)
+
+    def test_missing_parent_and_cycles_rejected(self):
+        def span(span, parent, start=0, service=""):
+            return {"span": span, "service": service, "parent": parent,
+                    "start": start, "end": None, "error": None}
+
+        # 父标识在任何服务中都不存在
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry().restore({"counters": [], "samples": [],
+                                 "spans": [span("a", "ghost")]})
+        # 同服务缺失但其他服务有同名：跨服务全局解析允许（与 r2@api->r1 一致）
+        Telemetry().restore({"counters": [], "samples": [], "spans": [
+            span("a", "g", service="s1"),
+            span("g", None, service="s2"),
+        ]})
+        # 二连成环
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry().restore({"counters": [], "samples": [], "spans": [
+                span("a", "b", 0), span("b", "a", 1)]})
+        # 自环
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry().restore({"counters": [], "samples": [],
+                                 "spans": [span("a", "a")]})
+        # 长链成环（迭代遍历，不触及递归深度）
+        n = 3000
+        chain = [span(str(i), str(i + 1), i) for i in range(n - 1)]
+        chain.append(span(str(n - 1), "0", n - 1))
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry().restore({"counters": [], "samples": [], "spans": chain})
+        # 同样长度的合法长链可以恢复
+        ok_chain = [span("0", None, 0)] + [
+            span(str(i), str(i - 1), i) for i in range(1, n)
+        ]
+        r = Telemetry()
+        r.restore({"counters": [], "samples": [], "spans": ok_chain})
+        self.assertEqual(len(r.spans), n)
+
+    def test_unhashable_parent_has_no_edge_and_is_preserved(self):
+        # start() 既有行为允许不可哈希父标识；它不可能等于任何跨度键，
+        # 恢复时原样保留，不构成悬空引用也不参与成环判定。
+        t = Telemetry(iter(range(5)).__next__)
+        t.start("a", parent=["x"])
+        for payload in (t.snapshot(), t.json()):
+            r = Telemetry()
+            r.restore(payload)
+            self.assertEqual(r.query("open")[0]["parent"], ["x"])
+
+    def test_unicode_empty_and_edge_numbers_are_deterministic(self):
+        t = Telemetry()
+        t.inc("", 0, service=None)
+        t.inc("", -0.0, labels=(("", ""),))
+        t.observe("", 1e-308)
+        t.observe("", -5e-324)
+        t.start("")
+        text = t.json()
+        # 同一快照恢复两次并做相同续采，结果逐字一致；入口可重复调用
+        a = Telemetry()
+        b = Telemetry()
+        a.restore(text)
+        b.restore(text)
+        a.restore(text)
+        a.inc("", -1, labels=(("", ""),))
+        b.inc("", -1, labels=(("", ""),))
+        self.assertEqual(a.json(), b.json())
+        self.assertEqual(a.snapshot(), a.snapshot())
+
+    def test_input_not_mutated_or_shared(self):
+        payload = self.build().snapshot()
+        saved = copy.deepcopy(payload)
+        r = Telemetry()
+        r.restore(payload)
+        self.assertEqual(payload, saved)  # 输入对象未被改写
+        payload["counters"][0]["value"] = 999
+        payload["samples"][0]["values"].append(999)
+        payload["spans"][0]["parent"] = "changed"
+        again = Telemetry()
+        again.restore(copy.deepcopy(saved))
+        self.assertEqual(r.snapshot(), again.snapshot())
+
+    def test_restore_does_not_read_clock_or_network(self):
+        class BoomClock:
+            reads = 0
+
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("restore must not read clock")
+
+        payload = self.build().json()
+        Telemetry(BoomClock()).restore(payload)
+        self.assertEqual(BoomClock.reads, 0)
+        src = appmod.__file__
+        with open(src, encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in ("socket", "urllib", "requests", "http.client"):
+            self.assertNotIn(forbidden, source)
+
+    def test_existing_entries_still_raise_valueerror_and_stay_compatible(self):
+        # SnapshotFormatError 是 ValueError：既有捕获方式全部继续生效；
+        # from_snapshot/merge 对悬空父引用保持既有宽松行为。
+        with self.assertRaises(ValueError):
+            Telemetry.from_snapshot("{not json}")
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.from_snapshot(
+                {"counters": [], "samples": [], "spans": [], "version": 9}
+            )
+        dangling = {"counters": [], "samples": [], "spans": [
+            {"span": "a", "service": "", "parent": "ghost",
+             "start": 0, "end": None, "error": None}]}
+        # from_snapshot/merge/diff 既有语义不强制父子闭合
+        Telemetry.from_snapshot(dangling)
+        t = Telemetry()
+        t.merge_snapshot(dangling)
+        Telemetry.diff_snapshots(
+            {"counters": [], "samples": [], "spans": []}, dangling
+        )
+        # 但格式错误在这些入口同样是 SnapshotFormatError
+        t2 = Telemetry()
+        before = t2.snapshot()
+        with self.assertRaises(SnapshotFormatError):
+            t2.merge_snapshot("{not json}")
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.diff_snapshots(
+                {"counters": [], "samples": [], "spans": [], "version": 2},
+                {"counters": [], "samples": [], "spans": []},
+            )
+        self.assertEqual(t2.snapshot(), before)
+        # 合并冲突仍是普通 ValueError（不是格式问题）
+        t3 = Telemetry(iter(range(10)).__next__)
+        t3.start("s")
+        t3.finish("s")
+        payload = t3.snapshot()
+        for record in payload["spans"]:
+            if record["span"] == "s":
+                record["error"] = "different"
+        with self.assertRaises(ValueError):
+            t3.merge_snapshot(payload)
 
 
 if __name__ == "__main__":

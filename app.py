@@ -4,6 +4,23 @@ import math
 import time
 
 
+class SnapshotFormatError(ValueError):
+    """快照恢复类入口（restore/from_snapshot/merge_snapshot/diff_snapshots）
+    的统一公开异常：快照文本无法解析、顶层不是对象、版本不受支持、必需字段
+    缺失或存在多余字段、字段类型错误、数值不是有限值、标签不能按既有规则
+    规范化、跨度标识重复、父跨度引用不存在或父子关系成环时一律抛出本异常。
+
+    刻意继承 ValueError：这些入口历史上公开约定的 ValueError 捕获方式
+    （含既有测试与调用方）继续有效，调用方可以逐步改用更具体的类型。
+    """
+
+
+# 当前受支持的快照格式版本。现有 snapshot()/json() 导出的快照顶层恰好是
+# counters/samples/spans 三个数组、不带版本字段，恢复时按该版本的既定
+# 规则读取（等价于显式携带 "version": 1）；任何其他版本一律拒绝。
+SNAPSHOT_VERSION = 1
+
+
 class _Orderable:
     """排序包装：优先按自然序比较，类型不可比时回退到 repr 字符串，
     保证快照排序在混合类型标签/标识下也不会失败。"""
@@ -749,16 +766,57 @@ class Telemetry:
 
     _STATS_KEYS = ("count", "sum", "minimum", "maximum", "mean")
 
+    # 快照顶层允许出现的全部键：现有导出格式不含版本字段（按 SNAPSHOT_VERSION
+    # 读取），显式给出 "version" 时必须等于受支持版本。
+    _SNAPSHOT_DATA_KEYS = {"counters", "samples", "spans"}
+    _SNAPSHOT_VERSION_KEYS = _SNAPSHOT_DATA_KEYS | {"version"}
+
+    def restore(self, payload):
+        """快照恢复与离线续采：把一份现有快照格式的 JSON 文本、UTF-8 字节
+        或等价字典恢复进当前实例，成功返回 None，随后可继续 inc/observe/
+        start/finish，沿用当前入口既有的累加、更新与生命周期语义。
+
+        校验快照版本、顶层结构、服务名、标签、计数器、数值样本及其统计、
+        跨度标识与父子引用：除 None 外且可哈希的父标识必须引用一个存在的
+        跨度（同服务优先，其次唯一的跨服务同名跨度；0、空串等假值标识同样
+        按真实标识处理），父子关系不允许成环，同一服务内不允许重复跨度
+        标识；不可哈希的父标识不构成引用。
+
+        任何不符合规则的输入统一抛 SnapshotFormatError：不可解析 JSON、
+        顶层不是对象、版本不受支持、必需字段缺失或字段多余、类型错误、
+        数值非有限、标签无法按既有规则规范化、父跨度不存在、成环或跨度
+        标识重复。恢复在全新的临时结构上完成全部解析与校验，最后才一次性
+        替换状态——失败时原聚合器的计数器、样本、跨度与 clock 配置完全
+        不变，输入对象也不被改写，恢复后的数据不与 payload 共享任何可变
+        对象。空快照（三个数组均空，含显式 version 形式）得到可继续使用
+        的空聚合器。全程不联网、不读写文件、不调用 clock。
+        """
+        data = self._restore_parse(payload)
+        counters, samples, spans = self._restore_validate(data, strict_graph=True)
+        # 全部校验通过后一次性发布；self 原有的三个结构在发布前保持不动，
+        # 因此即使 payload 与当前实例内部存在别名，也不会在校验途中污染
+        # 现有状态（解析阶段已深拷贝切断引用）。
+        self.counters = counters
+        self.samples = samples
+        self.spans = spans
+        return None
+
     @classmethod
     def from_snapshot(cls, payload, clock=time.time):
         """把 snapshot() 字典或 json() 文本重建为独立的 Telemetry 实例。
 
-        全程不联网、不读写文件、不修改输入；任何缺失/多余字段、非法 JSON、
-        重复记录、统计不一致、无效标签、不可哈希标识等内容一律抛 ValueError，
-        且不会在抛出前留下半成品实例或改动任何已有实例。
+        接受范围、版本规则与逐字段校验与 restore() 一致；任何不合法输入
+        统一抛 SnapshotFormatError（它同时是 ValueError，既有 ValueError
+        捕获继续有效）。成功前不会留下半成品实例，也不改动输入；全程不
+        联网、不读写文件、不调用 clock。恢复后实例与原对象互不共享数据，
+        open 跨度可继续用 finish() 结束。
+
+        既有行为保持兼容：本入口只做快照自身的结构与字段校验，不强制父
+        引用闭合或父子无环（跨分片、跨服务引用照常恢复）；需要恢复后继续
+        生命周期语义并获得完整父子图校验时，使用实例入口 restore()。
         """
         data = cls._restore_parse(payload)
-        counters, samples, spans = cls._restore_validate(data)
+        counters, samples, spans = cls._restore_validate(data, strict_graph=False)
         instance = cls(clock)
         instance.counters = counters
         instance.samples = samples
@@ -773,17 +831,17 @@ class Telemetry:
         """把另一份离线分片快照原子合并进当前实例，成功返回 None。
 
         输入接受范围与 from_snapshot 一致（快照字典、JSON 文本、UTF-8 字节）。
-        先完整解析并校验，再在临时结构上试合并，最后一次性提交：任何字段
-        缺失/多余、重复记录、非严格 JSON、无效标签、不可用标识、非有限样本、
-        计数器不可相加或同键跨度不一致都抛 ValueError，当前实例的全部聚合、
-        跨度与时钟配置保持不变，输入对象也不被改写；解析阶段已切断与
-        payload 的引用，合并后的数据不与 payload 或其中的列表、标签共享
-        可变对象。
+        先完整解析并校验，再在临时结构上试合并，最后一次性提交：快照本身的
+        格式/版本/字段/标签/有限值等问题统一抛 SnapshotFormatError；分片间
+        计数器不可相加或同键跨度不一致等合并冲突仍抛 ValueError。任何错误都
+        使当前实例的全部聚合、跨度与时钟配置保持不变，输入对象也不被改写；
+        解析阶段已切断与 payload 的引用，合并后的数据不与 payload 或其中的
+        列表、标签共享可变对象。单个分片允许父引用暂时悬空，由其他分片补全。
         """
         data = self._restore_parse(payload)
-        counters, samples, spans = self._restore_validate(data)
-
-        # 以下全部在副本上试合并，结束前绝不写回 self。
+        # 合并保持既有分片语义：单个分片内允许父引用暂时悬空（其他分片或后续
+        # 恢复可能补全），因此不启用 restore 的全图父子校验。
+        counters, samples, spans = self._restore_validate(data, strict_graph=False)
         merged_counters = dict(self.counters)
         for key, value in counters.items():
             if key in merged_counters:
@@ -872,8 +930,10 @@ class Telemetry:
         # 两边先全部解析并校验完成，之后才构造任何差异输出：任一输入无效
         # 都不会返回部分结果。
         after_data = cls._restore_parse(after)
-        before_state = cls._restore_validate(before_data)
-        after_state = cls._restore_validate(after_data)
+        # 差异是只读比较：沿用既有恢复解析与字段校验，但不要求单份快照的
+        # 父子引用在本侧闭合（分片快照、跨服务引用按既有规则照常比较）。
+        before_state = cls._restore_validate(before_data, strict_graph=False)
+        after_state = cls._restore_validate(after_data, strict_graph=False)
 
         def diff_section(before_pairs, after_pairs):
             before_map = dict(before_pairs)
@@ -931,64 +991,162 @@ class Telemetry:
         obj = {}
         for key, value in pairs:
             if key in obj:
-                raise ValueError("duplicate key in JSON object: %r" % (key,))
+                raise SnapshotFormatError(
+                    "duplicate key in JSON object: %r" % (key,)
+                )
             obj[key] = value
         return obj
 
     @staticmethod
     def _restore_constant(value):
         # parse_constant：NaN/Infinity 不是严格 JSON。
-        raise ValueError("non-strict JSON constant: %s" % (value,))
+        raise SnapshotFormatError("non-strict JSON constant: %s" % (value,))
 
     @classmethod
     def _restore_parse(cls, payload):
+        # 统一把快照输入解析为全新字典：JSON 文本、UTF-8 字节或等价对象；
+        # 任何解析层面的失败都归为公开的 SnapshotFormatError（ValueError
+        # 子类，既有 ValueError 捕获继续生效）。
         if isinstance(payload, str):
             text = payload
         elif isinstance(payload, (bytes, bytearray)):
             try:
                 text = bytes(payload).decode("utf-8")
             except Exception as exc:
-                raise ValueError("payload bytes are not valid UTF-8: %s" % (exc,))
+                raise SnapshotFormatError(
+                    "payload bytes are not valid UTF-8: %s" % (exc,)
+                )
         elif isinstance(payload, dict):
             # 深拷贝后再读取，保证新实例与原对象的列表、记录互不共享。
             try:
                 return copy.deepcopy(payload)
             except Exception as exc:
-                raise ValueError("payload cannot be restored: %s" % (exc,))
+                raise SnapshotFormatError(
+                    "payload cannot be restored: %s" % (exc,)
+                )
         else:
-            raise ValueError("payload must be a snapshot dict or JSON text")
+            raise SnapshotFormatError(
+                "payload must be a snapshot dict or JSON text"
+            )
         try:
             return json.loads(
                 text,
                 object_pairs_hook=cls._restore_pairs_hook,
                 parse_constant=cls._restore_constant,
             )
-        except ValueError:
+        except SnapshotFormatError:
             raise
-        except Exception as exc:
-            raise ValueError("invalid JSON payload: %s" % (exc,))
+        except ValueError as exc:  # json 抛出的 JSONDecodeError 等
+            raise SnapshotFormatError("invalid JSON payload: %s" % (exc,))
 
     @classmethod
-    def _restore_validate(cls, data):
+    def _restore_validate(cls, data, strict_graph):
+        # 顶层必须是对象；现有导出格式恰好含 counters/samples/spans 三个数组，
+        # 恢复时按 SNAPSHOT_VERSION 的既定规则读取，显式携带 version 时必须
+        # 精确等于受支持版本，缺字段、多字段或版本不符一律拒绝。
         if not isinstance(data, dict):
-            raise ValueError("payload must decode to a JSON object")
-        if set(data) != {"counters", "samples", "spans"}:
-            raise ValueError(
+            raise SnapshotFormatError("payload must decode to a JSON object")
+        keys = set(data)
+        if keys == cls._SNAPSHOT_DATA_KEYS:
+            version = SNAPSHOT_VERSION  # 无版本字段：按当前版本既定规则读取
+        elif keys == cls._SNAPSHOT_VERSION_KEYS:
+            version = data["version"]
+            # 与分位数 q 的入站规则一致：bool 是 int 子类必须显式排除，
+            # 只接受数值上精确等于受支持版本的有限 int/float；字符串 "1"、
+            # null、其他数字一律按不支持版本拒绝。
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, (int, float))
+                or not math.isfinite(version)
+                or version != SNAPSHOT_VERSION
+            ):
+                raise SnapshotFormatError(
+                    "unsupported snapshot version: %r" % (version,)
+                )
+        else:
+            raise SnapshotFormatError(
                 "payload must contain exactly counters, samples and spans"
+                " and an optional supported version"
             )
         for section in ("counters", "samples", "spans"):
             if not isinstance(data[section], list):
-                raise ValueError("%s must be an array" % (section,))
-        return (
-            cls._restore_counters(data["counters"]),
-            cls._restore_samples(data["samples"]),
-            cls._restore_spans(data["spans"]),
-        )
+                raise SnapshotFormatError("%s must be an array" % (section,))
+        counters = cls._restore_counters(data["counters"])
+        samples = cls._restore_samples(data["samples"])
+        spans = cls._restore_spans(data["spans"])
+        if strict_graph:
+            # restore() 要求恢复后可继续生命周期语义，因此父引用必须全局闭合
+            # 且父子关系无环；from_snapshot/合并/差异入口保持各自的宽松语义。
+            cls._restore_check_span_graph(spans)
+        return counters, samples, spans
+
+    @classmethod
+    def _restore_check_span_graph(cls, spans):
+        # 跨度父子图的全量校验：非空且可哈希的父标识必须引用一个存在的跨度
+        # （按标识全局解析：先查同服务，再查唯一的跨服务同名跨度），沿解析
+        # 出的边不允许成环。重复 (service, span) 已在记录解析阶段拒绝。
+        # 不可哈希的父标识（如数组）不可能精确等于任何跨度键，与 trace() 的
+        # 既有处理一致，不参与任何父子关系，也就不构成悬空引用或环。
+        ids_by_span = {}
+        for service, span in spans:
+            ids_by_span.setdefault(span, []).append(service)
+
+        edges = {}
+        for (service, span), record in spans.items():
+            parent = record["parent"]
+            if parent is None:
+                continue
+            try:
+                hash(parent)
+                candidates = ids_by_span.get(parent)
+            except TypeError:
+                # 不可哈希的父标识无法作为键，无法精确等于任何跨度标识。
+                continue
+            if not candidates:
+                raise SnapshotFormatError(
+                    "span %r references missing parent %r" % (span, parent)
+                )
+            if service in candidates:
+                target = (service, parent)  # 与 trace 一致：同服务优先
+            elif len(candidates) == 1:
+                target = (candidates[0], parent)  # 唯一跨服务同名父跨度
+            else:
+                # 多个跨服务同名父跨度且同服务内不存在：引用本身存在，
+                # 但无法唯一确定边，跳过以避免臆造父子关系。
+                continue
+            edges[(service, span)] = target
+
+        # 迭代式三色遍历：0 未访问、1 在当前路径、2 已完成；遇到 1 即成环。
+        # 用显式栈而非递归，避免长父子链触及递归深度限制。
+        color = {}
+        for root in spans:
+            if color.get(root, 0) != 0:
+                continue
+            stack = [root]
+            while stack:
+                node = stack[-1]
+                state = color.get(node, 0)
+                if state == 0:
+                    color[node] = 1
+                    nxt = edges.get(node)
+                    if nxt is not None:
+                        nxt_state = color.get(nxt, 0)
+                        if nxt_state == 1:
+                            raise SnapshotFormatError(
+                                "cycle detected in span parent references"
+                            )
+                        if nxt_state == 0:
+                            stack.append(nxt)
+                else:
+                    color[node] = 2
+                    stack.pop()
 
     @staticmethod
     def _restore_json_strict(value, what):
         if not Telemetry._is_json_strict(value):
-            raise ValueError("%s is not strictly JSON-representable" % (what,))
+            raise SnapshotFormatError(
+                "%s is not strictly JSON-representable" % (what,)
+            )
         return value
 
     @staticmethod
@@ -996,14 +1154,14 @@ class Telemetry:
         try:
             hash(value)
         except TypeError:
-            raise ValueError("%s must be hashable" % (what,))
+            raise SnapshotFormatError("%s must be hashable" % (what,))
         return value
 
     @staticmethod
     def _restore_service(service):
         # 快照中的服务已归一化：默认服务为空字符串，其余为非空字符串。
         if not isinstance(service, str):
-            raise ValueError("service must be a string")
+            raise SnapshotFormatError("service must be a string")
         return service
 
     @classmethod
@@ -1015,13 +1173,19 @@ class Telemetry:
     @classmethod
     def _restore_labels(cls, labels):
         if not isinstance(labels, (list, tuple)):
-            raise ValueError("labels must be an array of pairs")
+            raise SnapshotFormatError("labels must be an array of pairs")
         for item in labels:
             if not isinstance(item, (list, tuple)) or len(item) != 2:
-                raise ValueError("labels must be an array of pairs")
+                raise SnapshotFormatError("labels must be an array of pairs")
         # 复用既有归一化：排序、重复键与严格 JSON 校验一致；数组/对象值
-        # 冻结为可哈希规范形式后与写入路径使用同一聚合键。
-        return cls._normalize_labels(labels)
+        # 冻结为可哈希规范形式后与写入路径使用同一聚合键。该归一化在写入
+        # 入口抛 ValueError，这里统一转换为恢复契约的 SnapshotFormatError。
+        try:
+            return cls._normalize_labels(labels)
+        except SnapshotFormatError:
+            raise
+        except ValueError as exc:
+            raise SnapshotFormatError(str(exc))
 
     @staticmethod
     def _restore_sample_value(value):
@@ -1029,9 +1193,11 @@ class Telemetry:
         try:
             numeric = float(value)
         except (TypeError, ValueError):
-            raise ValueError("sample value must be numeric")
+            raise SnapshotFormatError("sample value must be numeric")
         if math.isnan(numeric) or math.isinf(numeric):
-            raise ValueError("sample value must be finite, got %r" % (value,))
+            raise SnapshotFormatError(
+                "sample value must be finite, got %r" % (value,)
+            )
         return value
 
     @classmethod
@@ -1040,7 +1206,7 @@ class Telemetry:
         fields = {"service", "name", "labels", "value"}
         for record in records:
             if not isinstance(record, dict) or set(record) != fields:
-                raise ValueError(
+                raise SnapshotFormatError(
                     "counter record must have exactly service, name, labels, value"
                 )
             service = cls._restore_service(record["service"])
@@ -1049,7 +1215,7 @@ class Telemetry:
             value = cls._restore_json_strict(record["value"], "counter value")
             key = (service, name, labels)
             if key in counters:
-                raise ValueError("duplicate counter record")
+                raise SnapshotFormatError("duplicate counter record")
             counters[key] = value
         return counters
 
@@ -1061,7 +1227,7 @@ class Telemetry:
         for record in records:
             keys = set(record) if isinstance(record, dict) else set()
             if not isinstance(record, dict) or not required <= keys or not keys <= allowed:
-                raise ValueError(
+                raise SnapshotFormatError(
                     "sample record must have service, name, labels, values"
                     " and optionally stats"
                 )
@@ -1070,14 +1236,14 @@ class Telemetry:
             labels = cls._restore_labels(record["labels"])
             values = record["values"]
             if not isinstance(values, list):
-                raise ValueError("sample values must be an array")
+                raise SnapshotFormatError("sample values must be an array")
             checked = []
             for value in values:
                 cls._restore_json_strict(value, "sample value")
                 checked.append(cls._restore_sample_value(value))
             key = (service, name, labels)
             if key in samples:
-                raise ValueError("duplicate sample record")
+                raise SnapshotFormatError("duplicate sample record")
             if checked:
                 # 统计一律按公开浮点规则从 values 重算；输入中存在的
                 # 统计字段必须与重算结果一致。
@@ -1088,12 +1254,12 @@ class Telemetry:
                             record[stat_key], "sample stat"
                         )
                         if given != stats[stat_key]:
-                            raise ValueError(
+                            raise SnapshotFormatError(
                                 "sample stats inconsistent with values"
                             )
             elif keys & set(cls._STATS_KEYS):
                 # 空 values 不附加统计字段。
-                raise ValueError("empty sample values must not carry stats")
+                raise SnapshotFormatError("empty sample values must not carry stats")
             samples[key] = checked
         return samples
 
@@ -1103,7 +1269,7 @@ class Telemetry:
         fields = {"span", "service", "parent", "start", "end", "error"}
         for record in records:
             if not isinstance(record, dict) or set(record) != fields:
-                raise ValueError(
+                raise SnapshotFormatError(
                     "span record must have exactly"
                     " span, service, parent, start, end, error"
                 )
@@ -1118,7 +1284,7 @@ class Telemetry:
             error = cls._restore_json_strict(record["error"], "error")
             key = (service, span)
             if key in spans:
-                raise ValueError("duplicate span record")
+                raise SnapshotFormatError("duplicate span record")
             spans[key] = {
                 "parent": parent,
                 "start": start,
