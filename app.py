@@ -609,6 +609,71 @@ class Telemetry:
         return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
 
     @staticmethod
+    def _check_histogram_boundaries(boundaries):
+        # 只接受非空的 list/tuple；元素必须是非 bool 的 int/float、有限且
+        # 严格递增，任一不合法统一 ValueError。返回全新的边界列表，与
+        # 调用方传入的容器互不共享。
+        if not isinstance(boundaries, (list, tuple)) or len(boundaries) == 0:
+            raise ValueError("boundaries must be a non-empty list or tuple")
+        checked = []
+        for boundary in boundaries:
+            if isinstance(boundary, bool) or not isinstance(boundary, (int, float)):
+                raise ValueError(
+                    "boundary must be an int or float, got %r" % (boundary,)
+                )
+            if not math.isfinite(boundary):
+                raise ValueError("boundary must be finite, got %r" % (boundary,))
+            if checked and boundary <= checked[-1]:
+                raise ValueError("boundaries must be strictly increasing")
+            checked.append(boundary)
+        return checked
+
+    def histogram(self, name, boundaries, labels=(), service=None):
+        """离线诊断：对一条已记录的样本序列统计数值分布，只读不改状态。
+
+        service、labels 与 name 的定位规则与 observe/percentile 完全一致
+        （service 缺省为默认服务，显式传入必须是非空字符串；标签按键排序、
+        拒绝重复键与不可序列化值；name 必须可哈希）。boundaries 必须是非空
+        的 list 或 tuple，元素为非 bool 的 int/float、有限且严格递增，任一
+        不合法统一抛 ValueError。全部校验都发生在读取样本之前：不读 clock、
+        不改变计数器、样本、跨度或输入对象，也不产生部分结果。
+
+        样本键不存在或序列为空返回 None。命中时按 observe 的公开浮点规则把
+        每个值转换为 float（无法转换或非有限统一 ValueError，不返回部分
+        结果），再按左开右闭分桶：第一桶统计小于等于 boundaries[0]，中间桶
+        统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。每次
+        调用都返回全新字典：boundaries 为与输入独立的边界列表（顺序与输入
+        一致），counts 为对应的整数计数列表，count 为各桶之和；修改返回值
+        不影响内部状态，查询不排序样本、不触发序列化，重复调用结果相同。
+        """
+        service = self._service(service)
+        labels = self._normalize_labels(labels)
+        self._restore_hashable(name, "name")
+        boundaries = self._check_histogram_boundaries(boundaries)
+        values = self.samples.get((service, name, labels))
+        if not values:  # 键不存在或空序列：无分布可言
+            return None
+        counts = [0] * (len(boundaries) + 1)
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise ValueError("sample value must be numeric")
+            if math.isnan(numeric) or math.isinf(numeric):
+                raise ValueError("sample value must be finite, got %r" % (value,))
+            # 左开右闭：index 为样本超过的边界个数，最后一桶兜底大于
+            # 全部边界的值；只累加计数，不回写、不重排 values。
+            index = 0
+            while index < len(boundaries) and numeric > boundaries[index]:
+                index += 1
+            counts[index] += 1
+        return {
+            "boundaries": list(boundaries),
+            "counts": counts,
+            "count": sum(counts),
+        }
+
+    @staticmethod
     def _sample_stats(values):
         floats = [float(value) for value in values]
         total = 0.0
