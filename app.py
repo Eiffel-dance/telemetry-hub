@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import time
@@ -980,6 +981,80 @@ class Telemetry:
                 safe_spans.append(safe_entry)
         snapshot["spans"] = safe_spans
         return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+    # ------------------------------------------------------------------
+    # 快照完整性指纹
+    # ------------------------------------------------------------------
+
+    # verify_digest 对 expected 的唯一合法形式：64 个小写十六进制字符。
+    _DIGEST_HEX_DIGITS = frozenset("0123456789abcdef")
+    _DIGEST_LENGTH = 64
+
+    def digest(self, service=None, labels=None, status=None):
+        """离线诊断：当前筛选视图的 SHA-256 完整性指纹，只读不改状态。
+
+        视图完全复用 json() 的生成规则：snapshot 的筛选、稳定排序与统计
+        重算，加上 json 的异常占位替换，最终以紧凑 JSON 文本（键排序、无
+        空白分隔符）的 UTF-8 字节计算 SHA-256，返回固定 64 个字符的小写
+        十六进制字符串。同一聚合状态与同一组筛选必然得到相同指纹；计数
+        值、样本原值、跨度的父子关系、标签、结束状态或异常内容变化后，
+        受影响视图的指纹随之改变。筛选语义与 snapshot/json 逐项一致，只
+        决定哪些记录进入被摘要的数组，不写入、清空或重排任何聚合数据；
+        非法筛选在读取聚合前抛 ValueError。视图无法按 json 的既有规则完
+        成序列化时（如计数值或时间戳不可 JSON 表示）统一抛 ValueError。
+        全程不读取 clock、不联网、不写文件，也不修改任何调用方对象；
+        指纹只作为返回值给出，不写回 snapshot 或 json 的输出。
+        """
+        try:
+            text = self.json(service=service, labels=labels, status=status)
+        except ValueError:
+            raise  # 筛选非法与序列化失败本就统一为 ValueError，原样传播
+        except Exception as exc:
+            # json.dumps 对不可表示的字段抛 TypeError 等底层异常：按序列化
+            # 失败的统一契约归为 ValueError，不向外泄漏其他异常类型。
+            raise ValueError(
+                "snapshot view cannot be serialized: %s" % (exc,)
+            )
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def verify_digest(cls, payload, expected, service=None, labels=None, status=None):
+        """离线诊断：回放前校验外部快照的完整性指纹，纯只读。
+
+        payload 接受 restore 支持的快照字典、JSON 文本与 UTF-8 字节，遵循
+        同一版本兼容范围；先按既有快照格式、标签、重复记录、统计一致性
+        与跨度引用规则完成严格解析（任何问题统一抛 SnapshotFormatError），
+        再以规范化后的当前视图按 digest 的同一规则计算指纹——字典键顺序、
+        标签输入顺序与可重算的样本统计字段都不会造成误判。expected 只能
+        是 64 位小写十六进制字符串，格式不合法抛 ValueError；筛选语义与
+        digest 完全一致，非法筛选同样在解析 payload 前抛 ValueError。
+        格式正确但摘要不同返回 False，匹配返回 True。全程不读取 clock、
+        不联网、不写文件，也不改写输入对象或任何聚合器状态。
+        """
+        if (
+            not isinstance(expected, str)
+            or len(expected) != cls._DIGEST_LENGTH
+            or any(ch not in cls._DIGEST_HEX_DIGITS for ch in expected)
+        ):
+            raise ValueError(
+                "expected must be a 64-character lowercase hex string"
+            )
+        # 与 diff_snapshots 一致的顺序：筛选先校验，之后才解析输入，
+        # 保证非法筛选不会先暴露为快照格式错误。digest 内部会按同一规则
+        # 再归一化一次，这里只为确定拒绝时机，不改写原始筛选参数。
+        cls._filter_service(service)
+        cls._filter_status(status)
+        if labels is not None:
+            cls._normalize_labels(labels)
+        counters, samples, spans = cls._restore_strict_state(payload)
+        # 在独立的临时实例上重放视图：解析产物已是全新结构，指纹计算
+        # 纯只读，不触碰任何既有实例的聚合；clock 从不被读取。
+        instance = cls()
+        instance.counters = counters
+        instance.samples = samples
+        instance.spans = spans
+        actual = instance.digest(service=service, labels=labels, status=status)
+        return actual == expected
 
     # ------------------------------------------------------------------
     # 离线快照恢复
