@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import time
@@ -980,6 +981,94 @@ class Telemetry:
                 safe_spans.append(safe_entry)
         snapshot["spans"] = safe_spans
         return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+    # ------------------------------------------------------------------
+    # 快照完整性指纹
+    # ------------------------------------------------------------------
+
+    _DIGEST_HEX_CHARS = frozenset("0123456789abcdef")
+
+    @classmethod
+    def _check_digest_expected(cls, expected):
+        # expected 只接受恰好 64 个字符的小写十六进制字符串：bytes、非字符串、
+        # 大写字母、过长/过短或含非十六进制字符一律 ValueError。
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(ch not in cls._DIGEST_HEX_CHARS for ch in expected)
+        ):
+            raise ValueError(
+                "expected digest must be a 64-character lowercase hex string"
+            )
+        return expected
+
+    def digest(self, service=None, labels=None, status=None):
+        """离线诊断：对当前筛选视图计算完整性指纹，返回 64 个字符的小写十六进制串。
+
+        视图生成规则与 snapshot()/json() 完全一致：service/labels/status
+        沿用同一组筛选、稳定排序、样本统计重算与异常占位规则（不可严格
+        JSON 表示的 error 按 json() 的既有规则替换为只含 type/message 的
+        对象），指纹就是对该视图紧凑 JSON 文本（sort_keys=True、
+        separators=(",", ":")）的 UTF-8 字节计算 SHA-256。因此同一聚合
+        状态与同一组筛选重复调用必然得到相同指纹；计数值、样本原值、
+        跨度父子关系、标签、结束状态或异常内容变化后，受影响视图的指纹
+        随之改变。筛选只决定哪些数组条目进入摘要，绝不写入、清空或重排
+        聚合器，也不向 snapshot()/json() 的结果新增任何字段，digest 本身
+        更不会出现在任何快照里。
+
+        非法筛选（service 非字符串、labels 不满足成对/重复键/严格 JSON
+        规则、status 不在 open/closed/error 内）与 json() 一样在读取聚合
+        前抛 ValueError。整个过程纯只读：不读取 clock、不联网、不写文件、
+        不改写任何输入；紧凑 JSON 无法按既有 json 规则生成时统一抛 ValueError。
+        """
+        # 直接复用 json()：筛选校验与归一化、快照排序、统计重算以及异常
+        # 占位规则都与既有入口逐项一致，不存在第二套序列化口径。
+        try:
+            text = self.json(service=service, labels=labels, status=status)
+            raw = text.encode("utf-8")
+        except ValueError:
+            raise
+        except Exception as exc:
+            # 紧凑序列化无法按既有 json 规则完成时统一为 ValueError，
+            # 不向调用方泄漏其他异常类型。
+            raise ValueError("digest view cannot be serialized: %s" % (exc,))
+        return hashlib.sha256(raw).hexdigest()
+
+    @classmethod
+    def verify_digest(cls, payload, expected, service=None, labels=None, status=None):
+        """回放前校验外部快照：其规范化后的当前视图指纹是否等于 expected。
+
+        payload 的接受范围与 restore 完全一致：snapshot() 字典、json()
+        文本或 UTF-8 字节，并遵循同一版本兼容范围；先按既有快照格式、
+        标签、重复记录、统计一致性与跨度父子引用规则完成解析（任一不通过
+        抛 SnapshotFormatError），再对恢复出的独立实例以给定筛选调用
+        digest()。因此字典键顺序、标签输入顺序以及可由 values 重算的
+        样本统计字段都不会造成误判。
+
+        expected 只能是恰好 64 个字符的小写十六进制字符串，否则抛
+        ValueError；service/labels/status 的取值与校验规则和 digest()
+        完全相同，非法筛选抛 ValueError，且 expected 格式与筛选的校验
+        都先于 payload 解析，失败时不产生半成品状态、不修改 payload。
+        校验全部通过后，指纹匹配返回 True，格式正确但摘要不同返回
+        False。整个过程不读取 clock、不联网、不写文件；紧凑 JSON 无法
+        按既有 json 规则生成时统一抛 ValueError。
+        """
+        cls._check_digest_expected(expected)
+        # 筛选先校验、归一化（与 diff_snapshots 一致，在解析输入之前），
+        # 但不把归一化后的冻结标签传给 digest——冻结标记不可 JSON 序列化，
+        # 这里只做校验，原始 labels 交给 digest 内的既有入口重新归一化。
+        service = cls._filter_service(service)
+        status = cls._filter_status(status)
+        if labels is not None:
+            cls._normalize_labels(labels)
+        # restore 接受快照字典、JSON 文本、UTF-8 字节，按同一版本兼容范围
+        # 完成全部字段、标签、重复记录、统计一致性与父子引用校验；无法
+        # 恢复时抛 SnapshotFormatError（ValueError 的子类）。恢复不读 clock。
+        restored = cls.restore(payload)
+        actual = restored.digest(
+            service=service, labels=labels, status=status
+        )
+        return actual == expected
 
     # ------------------------------------------------------------------
     # 离线快照恢复
