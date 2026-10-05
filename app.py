@@ -791,6 +791,92 @@ class Telemetry:
         }
 
     @staticmethod
+    def _check_duration_bound(value, name):
+        # 耗时边界只接受非 bool 的 int/float 或缺省（None 表示无界）：
+        # bool 是 int 的子类必须显式排除；Decimal、字符串等其他类型一律
+        # 拒绝。int 必然有限（超大 int 交给 math.isfinite 反而会抛
+        # OverflowError），只有 float 需要有限性检查。原值返回，后续与
+        # 耗时比较时沿用 Python 的精确 int/float 比较规则。
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "%s must be an int or float when provided, got %r"
+                % (name, value)
+            )
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("%s must be finite, got %r" % (name, value))
+        return value
+
+    def spans_by_duration(
+        self, minimum=None, maximum=None, service=None, labels=None, status="closed"
+    ):
+        """离线诊断：按耗时范围查找已结束跨度，只读不改状态。
+
+        只查找已经结束的跨度。status 只接受 'closed' 与 'error'：'closed'
+        包含所有 end 已写入的跨度（成功结束与带异常结束都包含），'error'
+        只包含其中 error 不为 None 的跨度（0、False、空容器等假值也不
+        例外）；传入 'open' 或任何其他值（含 None 与非字符串）统一抛
+        ValueError。service 与 labels 的筛选语义与 query 完全一致：service
+        缺省（None）匹配全部服务，提供时只能是字符串，空字符串表示默认
+        服务；labels 缺省匹配全部标签，提供时沿用 observe 的成对输入、键
+        排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配
+        （显式空标签只命中无标签跨度）。minimum 与 maximum 缺省（None）
+        表示对应方向无界，提供时只能是非 bool 的 int 或 float 且必须为
+        有限值；同时给出时 minimum 不得大于 maximum。状态、服务、标签或
+        边界校验失败都在读取任何跨度之前抛 ValueError：不读 clock、不
+        产生部分结果、不改变聚合状态与调用方对象。
+
+        候选按 query/snapshot 的稳定顺序（服务、开始时间、标识）排列，
+        每个候选的耗时为 end 与 start 各自按现有样本统计的有限浮点规则
+        转换后相减得到的 Python float；任一候选跨度的起止时间无法转换为
+        有限数值时统一抛 ValueError（含超大整数溢出与自定义 __float__
+        异常），不返回部分结果（未结束跨度不参与查找，其时间戳不会被
+        读取转换）。边界按闭区间判定：minimum <= duration <= maximum。
+        命中项在 query 的跨度记录（span/service/parent/start/end/error，
+        有标签的跨度附 labels）上增加 duration 字段；每条记录都由
+        _span_entry 全新构造，可变容器逐层重建，调用方改写返回列表、
+        记录或标签不影响聚合器，error 原值（含异常实例）原样保留。
+        无匹配返回空列表；重复调用结果相同。整个过程纯只读，不联网，
+        duration 只存在于本入口的返回值中，不写入 snapshot 或 json。
+        """
+        # 全部入站校验先于数据读取：status 只允许 closed/error（open 与其
+        # 他任何值一律拒绝），service/labels 沿用 query 的筛选与归一化
+        # 规则，边界各自校验后再检查相互顺序。
+        if status not in ("closed", "error"):
+            raise ValueError("status must be 'closed' or 'error'")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        minimum = self._check_duration_bound(minimum, "minimum")
+        maximum = self._check_duration_bound(maximum, "maximum")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError("minimum must not exceed maximum")
+        # 复用跨度条目的唯一构造点：closed/error 本身就只含已结束跨度，
+        # 筛选与排序和 query/snapshot 逐项一致，未结束跨度不会进入列表。
+        entries = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status, labels
+            )
+        ]
+        # 每个候选的起止时间都按样本统计的公开浮点规则转换：任一候选
+        # 无法转换即统一 ValueError，抛出不返回任何部分结果。耗时为
+        # end 的 float 减 start 的 float，边界按闭区间判定。
+        results = []
+        for entry in entries:
+            started_at = self._finite_float(entry["start"])
+            ended_at = self._finite_float(entry["end"])
+            duration = ended_at - started_at
+            if minimum is not None and duration < minimum:
+                continue
+            if maximum is not None and duration > maximum:
+                continue
+            entry["duration"] = duration
+            results.append(entry)
+        return results
+
+    @staticmethod
     def _sample_stats(values):
         # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
         floats = [Telemetry._finite_float(value) for value in values]
