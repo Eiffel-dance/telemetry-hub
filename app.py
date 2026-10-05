@@ -146,8 +146,8 @@ def _isolate_mutable(value, _memo=None):
 class SnapshotFormatError(ValueError):
     """快照恢复格式错误的公开异常类型。
 
-    所有快照恢复入口（from_snapshot/merge_snapshot/diff_snapshots/restore/
-    restore_snapshot）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失
+    所有快照恢复入口（from_snapshot/merge_snapshot/merge_snapshots/
+    diff_snapshots/restore/restore_snapshot）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失
     或类型错误的字段、非有限数值、无法按既有规则规范化的标签、悬空或成环
     的父子引用、重复跨度标识等输入问题统一抛出本异常。它是 ValueError 的
     子类，既有按 ValueError 捕获的调用方行为不变。
@@ -1117,6 +1117,28 @@ class Telemetry:
 
         # 以下全部在副本上试合并，结束前绝不写回 self。
         merged_counters = dict(self.counters)
+        merged_samples = dict(self.samples)
+        merged_spans = dict(self.spans)
+        self._merge_state_into(
+            merged_counters, merged_samples, merged_spans,
+            counters, samples, spans,
+        )
+
+        self.counters = merged_counters
+        self.samples = merged_samples
+        self.spans = merged_spans
+        return None
+
+    @staticmethod
+    def _merge_state_into(merged_counters, merged_samples, merged_spans,
+                          counters, samples, spans):
+        # 单份已校验状态并入累加副本的唯一实现点，merge_snapshot 与
+        # merge_snapshots 共用，逐份与批量合并语义因此完全一致：
+        # 计数器同键按当前值在前、输入值在后相加，不可相加抛 ValueError；
+        # 样本同键新建列表，先保留当前 values 再按输入顺序追加，原值类型
+        # 与写入顺序不变，统计在 snapshot 时统一重算；跨度仅一侧存在时
+        # 复制，两方记录完全一致才幂等，任一字段不同抛 ValueError。
+        # 只改写 merged_* 副本，不接触 self，也不改动输入状态。
         for key, value in counters.items():
             if key in merged_counters:
                 try:  # 与 inc 相同的加法语义：当前值在前、输入值在后
@@ -1127,7 +1149,6 @@ class Telemetry:
                     )
             merged_counters[key] = value
 
-        merged_samples = dict(self.samples)
         for key, values in samples.items():
             if key in merged_samples:
                 # 新建列表：先保留当前 values，再按输入顺序追加，
@@ -1135,7 +1156,6 @@ class Telemetry:
                 values = merged_samples[key] + values
             merged_samples[key] = values
 
-        merged_spans = dict(self.spans)
         for key, record in spans.items():
             if key in merged_spans:
                 try:  # 两方记录完全一致才幂等，不猜测生命周期如何更新
@@ -1152,6 +1172,44 @@ class Telemetry:
             else:
                 merged_spans[key] = record
 
+    def merge_snapshots(self, payloads):
+        """把多份离线分片快照按顺序一次性原子合并进当前实例，成功返回 None。
+
+        payloads 只能是由快照组成的列表或元组；空集合成功返回 None 且不
+        改变状态。每份快照的输入接受范围（快照字典、JSON 文本、UTF-8
+        字节）、严格字段校验、标签归一化、样本统计校验与跨度标识规则与
+        merge_snapshot 完全一致；合并顺序就是 payloads 中的顺序，成功
+        后的结果与按相同顺序逐次成功调用 merge_snapshot 完全一致。
+
+        原子性：先完成全部快照的解析与格式校验，再在副本上按顺序试合并
+        （含计数器相加与跨度一致性等相互冲突检查），全部通过后才一次性
+        提交。外层 payloads 不是列表或元组统一抛 ValueError；任一快照
+        格式无效抛 SnapshotFormatError；计数器不可相加或跨度记录冲突
+        （标签、父标识、时间、结束状态或异常值任一不同）抛 ValueError。
+        任何失败都使当前实例的计数器、样本、跨度与时钟配置保持调用前
+        状态；全程不读取 clock、不修改输入，合并后的数据不与 payloads
+        或其中的列表、标签共享可变对象。
+        """
+        if not isinstance(payloads, (list, tuple)):
+            raise ValueError("payloads must be a list or tuple of snapshots")
+        if len(payloads) == 0:  # 空集合成功：不解析、不复制、不改变状态
+            return None
+        # 先完成全部快照的解析与严格校验：任一格式问题都是
+        # SnapshotFormatError，此阶段不接触 self 的任何聚合。
+        states = []
+        for payload in payloads:
+            data = self._restore_parse(payload)
+            states.append(self._restore_validate(data))
+        # 再在副本上按 payloads 顺序试合并，全部冲突检查通过后才提交；
+        # 任一失败丢弃局部副本，self 仍指向调用前的结构。
+        merged_counters = dict(self.counters)
+        merged_samples = dict(self.samples)
+        merged_spans = dict(self.spans)
+        for counters, samples, spans in states:
+            self._merge_state_into(
+                merged_counters, merged_samples, merged_spans,
+                counters, samples, spans,
+            )
         self.counters = merged_counters
         self.samples = merged_samples
         self.spans = merged_spans
