@@ -1114,48 +1114,83 @@ class Telemetry:
         """
         data = self._restore_parse(payload)
         counters, samples, spans = self._restore_validate(data)
-
-        # 以下全部在副本上试合并，结束前绝不写回 self。
-        merged_counters = dict(self.counters)
-        for key, value in counters.items():
-            if key in merged_counters:
-                try:  # 与 inc 相同的加法语义：当前值在前、输入值在后
-                    value = merged_counters[key] + value
-                except Exception as exc:
-                    raise ValueError(
-                        "counter values cannot be added: %s" % (exc,)
-                    )
-            merged_counters[key] = value
-
-        merged_samples = dict(self.samples)
-        for key, values in samples.items():
-            if key in merged_samples:
-                # 新建列表：先保留当前 values，再按输入顺序追加，
-                # 原值类型与写入顺序不变；统计在 snapshot 时统一重算。
-                values = merged_samples[key] + values
-            merged_samples[key] = values
-
-        merged_spans = dict(self.spans)
-        for key, record in spans.items():
-            if key in merged_spans:
-                try:  # 两方记录完全一致才幂等，不猜测生命周期如何更新
-                    conflict = merged_spans[key] != record
-                except Exception as exc:
-                    raise ValueError(
-                        "span records cannot be compared: %s" % (exc,)
-                    )
-                if conflict:
-                    raise ValueError(
-                        "conflicting span record for service=%r span=%r"
-                        % (key[0], key[1])
-                    )
-            else:
-                merged_spans[key] = record
-
-        self.counters = merged_counters
-        self.samples = merged_samples
-        self.spans = merged_spans
+        merged = self._merged_state(((counters, samples, spans),))
+        self.counters, self.samples, self.spans = merged
         return None
+
+    def merge_snapshots(self, payloads):
+        """把多份离线分片快照一次性原子合并进当前实例，成功返回 None。
+
+        payloads 只能是由快照组成的列表或元组，其他类型统一抛 ValueError；
+        空列表或空元组视为成功，直接返回 None 且不改变任何状态。每份快照
+        的输入接受范围与校验规则和 merge_snapshot 完全一致（快照字典、
+        JSON 文本或 UTF-8 字节；严格字段校验、标签归一化、样本统计校验与
+        跨度标识规则），合并顺序就是 payloads 中的顺序，成功后的结果与按
+        相同顺序逐次成功调用 merge_snapshot 完全一致。
+
+        原子性：先对全部输入完成解析与格式校验（任一无效抛
+        SnapshotFormatError），再在临时结构上按顺序试合并完成所有相互
+        冲突检查（计数器不可相加或同键跨度不一致抛 ValueError），全部
+        通过后才一次性提交。任何失败都使当前实例的计数器、样本、跨度和
+        时钟配置保持调用前状态；全程不读取 clock、不修改输入，合并后的
+        数据不与任何 payload 共享可变对象。
+        """
+        if not isinstance(payloads, (list, tuple)):
+            raise ValueError("payloads must be a list or tuple of snapshots")
+        if len(payloads) == 0:  # 空集合成功：不解析、不读 clock、不改变状态
+            return None
+        # 第一阶段：全部输入完成解析与格式校验，任一无效即抛
+        # SnapshotFormatError，此阶段不触碰任何聚合状态。
+        states = []
+        for payload in payloads:
+            data = self._restore_parse(payload)
+            states.append(self._restore_validate(data))
+        # 第二阶段：在副本上按顺序试合并，冲突检查全部通过后才提交。
+        merged = self._merged_state(states)
+        self.counters, self.samples, self.spans = merged
+        return None
+
+    def _merged_state(self, states):
+        # merge_snapshot/merge_snapshots 共用的试合并：在 self 状态的副本上
+        # 按 states 的顺序依次合并每份已校验分片，全部成功才返回新的
+        # (counters, samples, spans)；任何冲突抛 ValueError，self 的聚合
+        # 在调用方提交前不被触碰。分片状态均来自 _restore_validate 新建的
+        # 结构，合并结果不与输入 payload 共享可变对象。
+        merged_counters = dict(self.counters)
+        merged_samples = dict(self.samples)
+        merged_spans = dict(self.spans)
+        for counters, samples, spans in states:
+            for key, value in counters.items():
+                if key in merged_counters:
+                    try:  # 与 inc 相同的加法语义：当前值在前、输入值在后
+                        value = merged_counters[key] + value
+                    except Exception as exc:
+                        raise ValueError(
+                            "counter values cannot be added: %s" % (exc,)
+                        )
+                merged_counters[key] = value
+            for key, values in samples.items():
+                if key in merged_samples:
+                    # 新建列表：先保留当前 values，再按输入顺序追加，
+                    # 原值类型与写入顺序不变；统计在 snapshot 时统一重算。
+                    values = merged_samples[key] + values
+                merged_samples[key] = values
+            for key, record in spans.items():
+                if key in merged_spans:
+                    try:  # 两方记录完全一致才幂等，不猜测生命周期如何更新
+                        conflict = merged_spans[key] != record
+                    except Exception as exc:
+                        raise ValueError(
+                            "span records cannot be compared: %s" % (exc,)
+                        )
+                    if conflict:
+                        raise ValueError(
+                            "conflicting span record for service=%r span=%r"
+                            % (key[0], key[1])
+                        )
+                else:
+                    merged_spans[key] = record
+        return merged_counters, merged_samples, merged_spans
 
     # ------------------------------------------------------------------
     # 离线快照差异

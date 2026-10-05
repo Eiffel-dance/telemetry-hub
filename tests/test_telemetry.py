@@ -576,6 +576,172 @@ class TelemetryMergeTest(unittest.TestCase):
             self.assertEqual(t.snapshot(), before, msg="case %d" % index)
 
 
+class TelemetryMergeManyTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.inc("hits", 2, labels=(("a", 1),))
+        t.observe("lat", 1, service="api")
+        t.start("r1")
+        t.finish("r1", error="boom")
+        return t
+
+    def shard_a(self):
+        p = Telemetry(iter(range(2000)).__next__)
+        p.inc("hits", 3, labels=(("a", 1),))
+        p.inc("only", 5, service="api")
+        p.observe("lat", 2.5, service="api")
+        p.start("open1", service="api", parent="p")
+        return p.snapshot()
+
+    def shard_b(self):
+        p = Telemetry(iter(range(3000)).__next__)
+        p.inc("hits", 4, labels=(("a", 1),))
+        p.observe("lat", "3.5", service="api")
+        p.observe("lat", 4, service="web")
+        p.start("r2")
+        p.finish("r2")
+        return p.snapshot()
+
+    def test_empty_collection_succeeds_without_touching_state(self):
+        t = self.build()
+        before = t.snapshot()
+        for empty in ([], ()):
+            self.assertIsNone(t.merge_snapshots(empty))
+            self.assertEqual(t.snapshot(), before)
+
+    def test_outer_container_must_be_list_or_tuple(self):
+        t = self.build()
+        before = t.snapshot()
+        for bad in (None, "x", b"x", 1, {"counters": [], "samples": [], "spans": []},
+                    {"a", "b"}, (s for s in ())):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.merge_snapshots(bad)
+            self.assertEqual(t.snapshot(), before)
+
+    def test_mixed_input_forms_merge_in_order(self):
+        text = json.dumps(self.shard_b(), sort_keys=True, separators=(",", ":"))
+        t = self.build()
+        self.assertIsNone(
+            t.merge_snapshots([self.shard_a(), text, text.encode("utf-8")])
+        )
+        counters = {
+            (c["service"], c["name"], tuple(c["labels"])): c["value"]
+            for c in t.snapshot()["counters"]
+        }
+        self.assertEqual(counters[("", "hits", (("a", 1),))], 2 + 3 + 4 + 4)
+        self.assertEqual(counters[("api", "only", ())], 5)
+        samples = {(s["service"], s["name"]): s for s in t.snapshot()["samples"]}
+        self.assertEqual(
+            samples[("api", "lat")]["values"], [1, 2.5, "3.5", "3.5"]
+        )
+        self.assertEqual(samples[("api", "lat")]["count"], 4)
+        self.assertEqual(samples[("web", "lat")]["values"], [4, 4])
+        self.assertEqual(
+            {(e["service"], e["span"]) for e in t.query("open")},
+            {("api", "open1")},
+        )
+        self.assertEqual(
+            {(e["service"], e["span"]) for e in t.query("closed")},
+            {("", "r1"), ("", "r2")},
+        )
+
+    def test_matches_sequential_merge_snapshot(self):
+        shards = [self.shard_a(), self.shard_b(), self.shard_a()]
+        combined = self.build()
+        combined.merge_snapshots(shards)
+        sequential = self.build()
+        for shard in shards:
+            sequential.merge_snapshot(shard)
+        self.assertEqual(combined.snapshot(), sequential.snapshot())
+        self.assertEqual(combined.json(), sequential.json())
+
+    def test_tuple_of_payloads_accepted(self):
+        t = self.build()
+        self.assertIsNone(t.merge_snapshots((self.shard_a(), self.shard_b())))
+        counters = {
+            (c["service"], c["name"]): c["value"]
+            for c in t.snapshot()["counters"]
+        }
+        self.assertEqual(counters[("", "hits")], 9)
+
+    def test_identical_spans_across_shards_are_idempotent(self):
+        t = self.build()
+        own = {"counters": [], "samples": [], "spans": t.snapshot()["spans"]}
+        before = t.snapshot()
+        t.merge_snapshots([own, own, self.shard_a()])
+        self.assertEqual(t.snapshot()["spans"], before["spans"] + self.shard_a()["spans"])
+
+    def test_invalid_member_rolls_back_everything(self):
+        t = self.build()
+        before = t.snapshot()
+        bad_cases = [
+            b"\xff not utf-8",
+            "{not json",
+            {"counters": [], "samples": []},
+            {"counters": [], "samples": [], "spans": [], "extra": 1},
+        ]
+        for index, bad in enumerate(bad_cases):
+            with self.assertRaises(SnapshotFormatError, msg="case %d" % index):
+                t.merge_snapshots([self.shard_a(), bad])
+            self.assertEqual(t.snapshot(), before, msg="case %d" % index)
+
+    def test_conflict_in_later_shard_rolls_back_everything(self):
+        t = self.build()
+        before = t.snapshot()
+        conflict = self.shard_a()
+        for record in conflict["spans"]:
+            if record["span"] == "open1":
+                record["parent"] = "different"
+        with self.assertRaises(ValueError):
+            t.merge_snapshots([self.shard_b(), self.shard_a(), conflict])
+        self.assertEqual(t.snapshot(), before)
+
+    def test_counter_add_failure_rolls_back_everything(self):
+        t = Telemetry.from_snapshot({
+            "counters": [
+                {"service": "", "name": "c", "labels": [], "value": "ab"},
+            ],
+            "samples": [],
+            "spans": [],
+        })
+        before = t.snapshot()
+        good = {"counters": [
+            {"service": "", "name": "d", "labels": [], "value": 1},
+        ], "samples": [], "spans": []}
+        bad = {"counters": [
+            {"service": "", "name": "c", "labels": [], "value": 1},
+        ], "samples": [], "spans": []}
+        with self.assertRaises(ValueError):
+            t.merge_snapshots([good, bad])
+        self.assertEqual(t.snapshot(), before)
+
+    def test_format_error_anywhere_beats_conflict(self):
+        # 全部输入先完成解析与格式检查，之后才做冲突检查：即使较早的分片
+        # 与当前状态冲突，较晚分片的格式问题仍按 SnapshotFormatError 抛出。
+        t = self.build()
+        conflict = self.shard_a()
+        for record in conflict["spans"]:
+            if record["span"] == "open1":
+                record["parent"] = "different"
+        with self.assertRaises(SnapshotFormatError):
+            t.merge_snapshots([conflict, "{not json"])
+
+    def test_clock_not_read_and_inputs_not_shared(self):
+        t = self.build()
+        t.clock = lambda: (_ for _ in ()).throw(AssertionError("clock read"))
+        shard_a, shard_b = self.shard_a(), self.shard_b()
+        copies = copy.deepcopy([shard_a, shard_b])
+        t.merge_snapshots([shard_a, shard_b])
+        self.assertEqual([shard_a, shard_b], copies)  # 输入未被改写
+        # 改动输入内部对象不影响已合并的实例
+        shard_a["counters"][0]["value"] = 999
+        shard_b["samples"][0]["values"].append(999)
+        again = self.build()
+        again.clock = t.clock
+        again.merge_snapshots(copies)
+        self.assertEqual(t.snapshot(), again.snapshot())
+
+
 class TelemetryTraceTest(unittest.TestCase):
     def build(self):
         clock = iter(range(100)).__next__
