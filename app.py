@@ -725,6 +725,70 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def span_duration_stats(self, service=None, labels=None, status="closed"):
+        """离线诊断：对已结束跨度的耗时（end 减 start）做汇总，只读不改状态。
+
+        只统计已经结束的跨度。status 只接受 'closed' 与 'error'：'closed'
+        包含所有 end 已写入的跨度（成功结束与带异常结束都包含），'error'
+        只包含其中 error 不为 None 的跨度（0、False、空容器等假值也不
+        例外）；传入 'open' 或任何其他值（含 None 与非字符串）统一抛
+        ValueError。service 与 labels 的筛选语义与 query 完全一致：service
+        缺省（None）匹配全部服务，提供时只能是字符串，空字符串表示默认
+        服务；labels 缺省匹配全部标签，提供时沿用 observe 的成对输入、键
+        排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配
+        （显式空标签只命中无标签跨度）。服务、标签或状态校验失败都在读取
+        任何跨度之前抛 ValueError：不读 clock、不产生部分结果、不改变聚合
+        状态与调用方对象。筛选后没有已结束跨度时返回 None。
+
+        命中时 values 按 query/snapshot 对跨度使用的稳定顺序（服务、开始
+        时间、标识）排列，每个元素是对应跨度 end 与 start 各自按现有样本
+        统计的有限浮点规则转换后相减得到的 Python float；任一结束跨度的
+        起止时间无法转换为有限数值时统一抛 ValueError，且先完成全部转换
+        再汇总，不返回部分结果（未结束跨度不参与统计，其时间戳不会被读取
+        转换）。count 等于 values 长度，sum 自 0.0 起按 values 顺序累加，
+        minimum/maximum 取这批耗时的最小/最大值，mean 等于 sum 除以 count。
+        每次调用都返回全新字典与全新列表，可安全修改，不与内部状态共享；
+        整个过程纯只读，不联网，也不向快照新增任何字段。
+        """
+        # 全部入站校验先于数据读取：status 只允许 closed/error（open 与其
+        # 他任何值一律拒绝），service/labels 沿用 query 的筛选与归一化规则。
+        if status not in ("closed", "error"):
+            raise ValueError("status must be 'closed' or 'error'")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 复用跨度条目的唯一构造点：closed/error 本身就只含已结束跨度，
+        # 筛选与排序和 query/snapshot 逐项一致，未结束跨度不会进入列表。
+        entries = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status, labels
+            )
+        ]
+        if not entries:  # 筛选后没有已结束跨度：无耗时统计可言
+            return None
+        # 全部起止时间先按样本统计的公开浮点规则转换：任一结束跨度的时间
+        # 戳无法转为有限数值即统一 ValueError（含超大整数溢出与自定义
+        # __float__ 异常），先转换完再汇总，保证不会边统计边失败而产生
+        # 部分结果。耗时为 end 的 float 减 start 的 float。
+        values = []
+        for entry in entries:
+            started_at = self._finite_float(entry["start"])
+            ended_at = self._finite_float(entry["end"])
+            values.append(ended_at - started_at)
+        total = 0.0
+        for number in values:  # 按稳定顺序累加，与样本统计的累加方式一致
+            total += number
+        count = len(values)
+        return {
+            "values": values,
+            "count": count,
+            "sum": total,
+            "minimum": min(values),
+            "maximum": max(values),
+            "mean": total / count,
+        }
+
     @staticmethod
     def _sample_stats(values):
         # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
