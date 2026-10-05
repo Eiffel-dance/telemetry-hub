@@ -2204,5 +2204,139 @@ class TelemetrySpanLabelsTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class SpanDurationStatsTest(unittest.TestCase):
+    def make_telemetry(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("a")                       # start=0
+        t.finish("a")                      # end=1, 无异常
+        t.start("b", labels=(("k", "v"),))  # start=2
+        t.finish("b", error="boom")        # end=3, 带异常
+        t.start("c", service="api")        # start=4
+        t.finish("c", service="api", error=0)  # end=5, 假值 error 仍算异常
+        t.start("open1")                   # start=6, 未结束
+        t.start("d", service="api", labels=(("k", "v"),))  # start=7
+        t.finish("d", service="api")       # end=8
+        return t
+
+    def test_closed_default_and_values(self):
+        t = self.make_telemetry()
+        stats = t.span_duration_stats()
+        # 只统计已结束跨度；按服务、开始时间、标识稳定顺序排列
+        self.assertEqual(stats["values"], [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(stats["count"], 4)
+        self.assertEqual(stats["sum"], 4.0)
+        self.assertEqual(stats["minimum"], 1.0)
+        self.assertEqual(stats["maximum"], 1.0)
+        self.assertEqual(stats["mean"], 1.0)
+        self.assertEqual(set(stats), {"values", "count", "sum", "minimum", "maximum", "mean"})
+        for value in stats["values"]:
+            self.assertIsInstance(value, float)
+
+    def test_error_status_and_filters(self):
+        t = self.make_telemetry()
+        errored = t.span_duration_stats(status="error")
+        self.assertEqual(errored["count"], 2)  # b 与 c；error=0 也算异常
+        self.assertEqual(errored["sum"], 2.0)
+        # service 筛选语义与 query 一致：空字符串表示默认服务
+        default_service = t.span_duration_stats(service="")
+        self.assertEqual(default_service["count"], 2)
+        api = t.span_duration_stats(service="api")
+        self.assertEqual(api["count"], 2)
+        # labels 筛选：显式空标签只命中无标签跨度
+        unlabeled = t.span_duration_stats(labels=())
+        self.assertEqual(unlabeled["count"], 2)
+        labeled = t.span_duration_stats(labels=(("k", "v"),))
+        self.assertEqual(labeled["count"], 2)
+        labeled_error = t.span_duration_stats(labels=(("k", "v"),), status="error")
+        self.assertEqual(labeled_error["count"], 1)
+        # 组合筛选与标签键序规范化
+        combo = t.span_duration_stats(service="api", labels=[("k", "v")])
+        self.assertEqual(combo["count"], 1)
+
+    def test_sum_accumulates_in_stable_order(self):
+        t = Telemetry(iter([0, 3, 1, 2]).__next__)
+        t.start("x")   # start=0
+        t.finish("x")  # end=3 -> 3.0
+        t.start("y")   # start=1
+        t.finish("y")  # end=2 -> 1.0
+        stats = t.span_duration_stats()
+        self.assertEqual(stats["values"], [3.0, 1.0])  # 按 start 排序
+        self.assertEqual(stats["sum"], 4.0)
+        self.assertEqual(stats["mean"], 2.0)
+
+    def test_no_match_returns_none(self):
+        t = self.make_telemetry()
+        self.assertIsNone(t.span_duration_stats(service="missing"))
+        self.assertIsNone(t.span_duration_stats(labels=(("no", "such"),)))
+        self.assertIsNone(t.span_duration_stats(status="error", service="", labels=()))
+        empty = Telemetry()
+        self.assertIsNone(empty.span_duration_stats())
+        only_open = Telemetry(lambda: 0.0)
+        only_open.start("o")
+        self.assertIsNone(only_open.span_duration_stats())
+
+    def test_invalid_arguments_raise_before_reading_and_without_clock(self):
+        calls = []
+        t = Telemetry(lambda: calls.append(1) or 0.0)
+        t.start("s")
+        t.finish("s")
+        self.assertEqual(len(calls), 2)
+        before = t.snapshot()
+        calls.clear()
+        for bad in ("open", "", "CLOSED", None, 0, b"closed", ["closed"]):
+            with self.assertRaises(ValueError):
+                t.span_duration_stats(status=bad)
+        for bad_service in (1, b"x", ["api"]):
+            with self.assertRaises(ValueError):
+                t.span_duration_stats(service=bad_service)
+        with self.assertRaises(ValueError):
+            t.span_duration_stats(labels=[("a", 1), ("a", 1)])
+        with self.assertRaises(ValueError):
+            t.span_duration_stats(labels="bad")
+        self.assertEqual(calls, [])  # 校验失败不读 clock
+        self.assertEqual(t.snapshot(), before)  # 聚合状态不变
+
+    def test_non_finite_timestamps_raise_valueerror(self):
+        t = Telemetry()
+        t.start("s")
+        t.finish("s")
+        t.spans[("", "s")]["end"] = float("nan")
+        with self.assertRaises(ValueError):
+            t.span_duration_stats()
+        t.spans[("", "s")]["end"] = 1.0
+        t.spans[("", "s")]["start"] = float("inf")
+        with self.assertRaises(ValueError):
+            t.span_duration_stats()
+        t.spans[("", "s")]["start"] = "nope"
+        with self.assertRaises(ValueError):
+            t.span_duration_stats()
+        # 失败的调用不修改聚合状态：修复数据后统计照常可用
+        t.spans[("", "s")]["start"] = 0.0
+        self.assertEqual(t.span_duration_stats()["values"], [1.0])
+
+    def test_result_is_fresh_and_safe_to_modify(self):
+        t = self.make_telemetry()
+        first = t.span_duration_stats()
+        first["values"].append(99.0)
+        first["count"] = 0
+        second = t.span_duration_stats()
+        self.assertEqual(second["values"], [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(second["count"], 4)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["values"], second["values"])
+
+    def test_open_spans_still_queryable_and_snapshot_unchanged(self):
+        t = self.make_telemetry()
+        self.assertEqual([e["span"] for e in t.query("open")], ["open1"])
+        snap = t.snapshot()
+        self.assertEqual(set(snap), {"counters", "samples", "spans"})
+        self.assertEqual(
+            set(snap["spans"][0]),
+            {"span", "service", "parent", "start", "end", "error"},
+        )
+        t.span_duration_stats()
+        self.assertEqual(t.snapshot(), snap)  # 统计调用不改任何状态
+
+
 if __name__ == "__main__":
     unittest.main()

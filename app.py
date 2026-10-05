@@ -725,6 +725,58 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def span_duration_stats(self, service=None, labels=None, status="closed"):
+        """离线诊断：对已记录跨度的耗时做汇总统计，只读不改状态。
+
+        只统计已结束的跨度。status 缺省为 "closed"（所有已结束跨度，成功
+        结束与带异常结束都包含），"error" 只保留已结束且 error 不为 None
+        的跨度（0、False、空容器等假值也不例外）；传入 "open" 或其他任何
+        值一律抛 ValueError。service 与 labels 的筛选语义与 query 完全
+        一致：service 缺省（None）不按服务限制，提供时只能是字符串（空
+        字符串表示默认服务），其他类型抛 ValueError；labels 缺省匹配全部
+        标签，提供时沿用 observe 的成对输入、键排序、重复键与严格 JSON
+        校验，按归一化后的完整标签集合精确匹配（显式空序列只命中无标签
+        记录）。所有校验都在读取任何跨度之前完成：不读 clock、不改变
+        聚合状态、不产生部分结果。
+
+        筛选后没有已结束跨度时返回 None。命中时按快照对跨度使用的服务、
+        开始时间、标识稳定顺序逐条计算耗时：start 与 end 都先按样本统计
+        的有限浮点规则转换，任一结束跨度的时间戳无法转换为有限数值时
+        统一抛 ValueError（同样不读 clock、不改状态、不返回部分结果）。
+        返回每次调用都新建、可安全修改的字典：values 为按稳定顺序排列的
+        耗时（end 减 start）Python float 列表，count 为 values 长度，sum
+        按该顺序累加，minimum/maximum 为最小/最大耗时，mean 为 sum 除以
+        count。该入口不向快照写入任何字段，也不改变其他入口的行为。
+        """
+        if status not in ("closed", "error"):
+            raise ValueError("status must be 'closed' or 'error'")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 复用跨度快照条目的唯一构造点：筛选与稳定排序和 query/snapshot
+        # 逐项一致，命中条目均为与聚合器隔离的全新记录。
+        pairs = self._span_snapshot_pairs(self.spans, service, status, labels)
+        if not pairs:
+            return None
+        # 先全部转换再汇总：任一时间戳无法按有限浮点规则转换时统一抛
+        # ValueError，不会边累加边失败而返回部分结果。
+        durations = [
+            self._finite_float(entry["end"]) - self._finite_float(entry["start"])
+            for _, entry in pairs
+        ]
+        count = len(durations)
+        total = 0.0
+        for duration in durations:  # 按稳定顺序累加，与样本统计同一规则
+            total += duration
+        return {
+            "values": durations,
+            "count": count,
+            "sum": total,
+            "minimum": min(durations),
+            "maximum": max(durations),
+            "mean": total / count,
+        }
+
     @staticmethod
     def _sample_stats(values):
         # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
