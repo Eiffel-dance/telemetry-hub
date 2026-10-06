@@ -1005,6 +1005,82 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def sample_summary(self, name, labels=None, service=None):
+        """离线诊断：一次汇总同名的全部非空样本序列，只读不改状态。
+
+        name 必须可哈希，不可哈希统一抛 ValueError。service 沿用快照筛选
+        语义：省略或显式 None 匹配全部服务，提供时只能是字符串并按精确
+        匹配筛选，空字符串表示默认服务，其他类型一律 ValueError。labels
+        省略或显式 None 表示匹配全部完整标签集合；提供标签序列时沿用
+        observe 的成对输入、键排序、重复键拒绝与严格 JSON 校验，按归一化
+        后的完整标签集合精确匹配，显式空序列只命中无标签样本。所有参数
+        校验都在读取任何样本之前完成：不读 clock、不产生部分结果、不改变
+        聚合状态与调用方对象。
+
+        参数通过后按快照对服务、名称、标签的现有稳定顺序选出同名且
+        values 非空的样本序列（空序列不参与汇总）；每条序列内部沿用
+        values 的写入顺序，把所有值按公开有限浮点规则转换后合并，任一
+        历史值无法转换为有限数值（含超大整数溢出、NaN/无穷与自定义
+        __float__ 抛出的异常）统一抛 ValueError，且全部值先转换完成才
+        形成结果，绝不返回部分字典，也不回写既有 values。
+
+        没有匹配的非空序列或没有可保留值时返回 None；命中时返回全新
+        字典，只含 series_count、count、sum、minimum、maximum、mean：
+        series_count 是参与汇总的非空序列数，count 是实际值总数（整数），
+        sum 自 0.0 起按确定顺序累加，minimum/maximum 是全体数值的最小/
+        最大值，mean 等于 sum 除以 count，除两个计数字段外均为 Python
+        float。结果与内部状态互不共享、可安全修改，重复调用结果一致；
+        该查询纯只读、不联网，不写入 snapshot/json/digest 或恢复载荷，
+        也不新增快照字段，既有写入、查询、快照、恢复、合并、批量、容量
+        与浮点统计行为保持不变。
+        """
+        # 全部入站校验先于样本读取：service 用快照筛选语义（None 全部服务、
+        # 字符串精确匹配、空串默认服务）；labels 缺省（None）匹配全部标签，
+        # 提供时按 observe 规则归一化，显式空序列只命中无标签样本；name
+        # 必须可哈希。任一失败都不读 clock、不产生部分结果。
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        self._restore_hashable(name, "name")
+        # 按快照对服务、名称、标签的稳定顺序选取同名非空序列；空 values
+        # 不参与汇总，与快照“空样本不产生统计”的处理保持一致。这里只
+        # 收集列表引用，绝不改写其中任何值或顺序。
+        matched = []
+        for (svc, series_name, key_labels), values in sorted(
+            self.samples.items(),
+            key=lambda item: _OrderableTuple(item[0]),
+        ):
+            if series_name != name:
+                continue
+            if service is not None and svc != service:
+                continue
+            if labels is not None and key_labels != labels:
+                continue
+            if not values:
+                continue
+            matched.append(values)
+        if not matched:  # 没有同名非空序列：无汇总可言
+            return None
+        # 序列顺序即快照顺序，序列内部沿用 values 写入顺序；全部值先按
+        # 公开有限浮点规则转换完再汇总，任一失败统一 ValueError，不返回
+        # 部分字典，转换只生成新 float，不回写 values。
+        numbers = []
+        for values in matched:
+            for value in values:
+                numbers.append(self._finite_float(value))
+        count = len(numbers)
+        total = 0.0
+        for number in numbers:  # 自 0.0 按确定顺序累加
+            total += number
+        return {
+            "series_count": len(matched),
+            "count": count,
+            "sum": total,
+            "minimum": min(numbers),
+            "maximum": max(numbers),
+            "mean": total / count,
+        }
+
     def span_duration_stats(self, service=None, labels=None, status="closed"):
         """离线诊断：对已结束跨度的耗时（end 减 start）做汇总，只读不改状态。
 
