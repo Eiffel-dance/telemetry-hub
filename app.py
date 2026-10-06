@@ -168,12 +168,20 @@ class TelemetryCapacityError(ValueError):
 
 
 class Telemetry:
-    def __init__(self, clock=time.time, max_series=None):
+    def __init__(self, clock=time.time, max_series=None, max_values_per_series=None):
         # 可选的指标序列容量保护：省略或显式 None 表示不设上限；其余只接受
         # 非 bool 的非负整数（bool 是 int 的子类，必须显式排除）。非法值统一
         # 抛普通 ValueError，实例不会被创建。计数器与样本各按
         # （service, name, 归一化 labels）占用一个序列名额，跨度不占配额。
         self.max_series = self._check_max_series(max_series)
+        # 可选的单序列样本保留上限：省略或显式 None 表示完整保留全部样本
+        # （既有行为逐项不变）；其余只接受非 bool 的非负整数，非法值统一抛
+        # 普通 ValueError。设置后每条样本序列只保留按写入顺序最新的
+        # max_values_per_series 个原值（0 表示序列可建立但 values 为空），
+        # 计数器与跨度不受影响；该设置不写入 snapshot/json/digest/diff。
+        self.max_values_per_series = self._check_max_values_per_series(
+            max_values_per_series
+        )
         self.clock = clock
         self.counters = {}
         self.samples = {}
@@ -195,6 +203,43 @@ class Telemetry:
                 % (max_series,)
             )
         return max_series
+
+    @staticmethod
+    def _check_max_values_per_series(max_values_per_series):
+        # 样本保留上限的唯一校验点：None 表示完整保留；其余必须是非 bool 的
+        # 非负整数，浮点数、负数、布尔、字符串等一律 ValueError。
+        if max_values_per_series is None:
+            return None
+        if (
+            isinstance(max_values_per_series, bool)
+            or not isinstance(max_values_per_series, int)
+            or max_values_per_series < 0
+        ):
+            raise ValueError(
+                "max_values_per_series must be a non-negative int or None,"
+                " got %r" % (max_values_per_series,)
+            )
+        return max_values_per_series
+
+    def _trim_sample_series(self, samples, key):
+        # 保留上限的唯一执行点：序列写入新样本后若超过实例上限，只保留按
+        # 写入顺序最新的 max_values_per_series 个原值，丢弃更早值；上限为
+        # 0 时序列保留但 values 为空。用新列表替换而非原地删除，绝不改动
+        # 调用前已存在的列表对象（合并试算与批量提交都工作在副本上）。
+        limit = self.max_values_per_series
+        if limit is None:
+            return
+        values = samples[key]
+        if len(values) > limit:
+            samples[key] = values[len(values) - limit:]
+
+    def _trim_all_sample_series(self, samples):
+        # 恢复/合并入口的整体截断：对提交后的样本结构逐序列应用保留上限，
+        # 只构造新列表，不触碰输入 payload 或旧状态中的列表。
+        if self.max_values_per_series is None:
+            return
+        for key in samples:
+            self._trim_sample_series(samples, key)
 
     def _series_used(self):
         # 已用序列数：计数器与样本序列分别计数，跨度不占配额。
@@ -291,6 +336,8 @@ class Telemetry:
         if key not in self.samples:
             self._check_capacity_for_new_key(self.counters, self.samples)
         self._apply_observe(self.samples, service, name, value, labels)
+        # 写入后按事件顺序应用保留上限：只保留最新的 N 个原值。
+        self._trim_sample_series(self.samples, key)
 
     def _check_capacity_for_new_key(self, counters, samples):
         # 单条写入（inc/observe）的容量门槛：假定恰有一个新键，序列总数将
@@ -459,6 +506,9 @@ class Telemetry:
             elif kind == "observe":
                 _, service, name, value, labels = action
                 self._apply_observe(samples, service, name, value, labels)
+                # 与逐条 observe 相同：每个事件追加后立即应用保留上限，
+                # 整批结果与按同一顺序逐条 observe 完全一致。
+                self._trim_sample_series(samples, (service, name, labels))
             elif kind == "start":
                 _, service, span, parent, labels = action
                 self._apply_start(spans, service, span, parent, labels, self.clock)
@@ -1276,7 +1326,8 @@ class Telemetry:
     _STATS_KEYS = ("count", "sum", "minimum", "maximum", "mean")
 
     @classmethod
-    def from_snapshot(cls, payload, clock=time.time, max_series=None):
+    def from_snapshot(cls, payload, clock=time.time, max_series=None,
+                      max_values_per_series=None):
         """把 snapshot() 字典或 json() 文本重建为独立的 Telemetry 实例。
 
         全程不联网、不读写文件、不修改输入；任何缺失/多余字段、非法 JSON、
@@ -1288,12 +1339,20 @@ class Telemetry:
         的非负整数（非法值抛 ValueError）；格式校验全部通过后再检查快照中
         的计数器与样本序列总数，超限抛 TelemetryCapacityError，此时不返回
         任何实例、输入也不被改写。跨度不占配额。
+
+        max_values_per_series 与构造函数同义：省略或 None 完整保留样本，
+        非法值抛 ValueError；设置后快照中超过上限的样本序列只保留按写入
+        顺序最新的 N 个原值，截断本身不产生额外异常。
         """
         max_series = cls._check_max_series(max_series)
+        max_values_per_series = cls._check_max_values_per_series(
+            max_values_per_series
+        )
         data = cls._restore_parse(payload)
         counters, samples, spans = cls._restore_validate(data)
-        instance = cls(clock, max_series)
+        instance = cls(clock, max_series, max_values_per_series)
         instance._check_series_capacity(counters, samples)
+        instance._trim_all_sample_series(samples)
         instance.counters = counters
         instance.samples = samples
         instance.spans = spans
@@ -1355,7 +1414,8 @@ class Telemetry:
                 color[item] = 2
 
     @classmethod
-    def restore(cls, payload, clock=time.time, max_series=None):
+    def restore(cls, payload, clock=time.time, max_series=None,
+                max_values_per_series=None):
         """严格恢复一份快照为可继续记录的新实例（离线续采）。
 
         接受 snapshot() 字典、json() 文本或 UTF-8 字节；顶层在 counters、
@@ -1373,11 +1433,20 @@ class Telemetry:
         ValueError；实例级恢复和合并沿用当前上限。快照中的计数器与样本序列
         总数超过上限时抛 TelemetryCapacityError，不返回任何实例；校验阶段
         不读 clock，跨度不占配额。
+
+        max_values_per_series 与构造函数同义：省略或 None 完整保留样本，
+        非法值抛 ValueError；实例级恢复和合并沿用当前实例的设置。设置后
+        快照中超过上限的样本序列只保留按写入顺序最新的 N 个原值，截断
+        本身不产生额外异常。
         """
         max_series = cls._check_max_series(max_series)
+        max_values_per_series = cls._check_max_values_per_series(
+            max_values_per_series
+        )
         counters, samples, spans = cls._restore_strict_state(payload)
-        instance = cls(clock, max_series)
+        instance = cls(clock, max_series, max_values_per_series)
         instance._check_series_capacity(counters, samples)
+        instance._trim_all_sample_series(samples)
         instance.counters = counters
         instance.samples = samples
         instance.spans = spans
@@ -1392,10 +1461,14 @@ class Telemetry:
         TelemetryCapacityError 都使当前实例的聚合、跨度、时钟配置与容量上限
         保持调用前状态，输入对象不被改写，恢复后的数据不与 payload 共享可
         变对象。空快照得到可继续使用的空聚合器。容量检查在解析校验完成后、
-        提交前进行，不读取 clock。
+        提交前进行，不读取 clock。样本保留上限沿用当前实例的设置：超过上限
+        的序列只保留按写入顺序最新的 N 个原值，截断不产生额外异常。
         """
         counters, samples, spans = self._restore_strict_state(payload)
         self._check_series_capacity(counters, samples)
+        # 沿用当前实例的样本保留上限：超过上限的序列只保留最新窗口，
+        # 截断在提交前完成，不产生额外异常，也不改写输入。
+        self._trim_all_sample_series(samples)
         self.counters = counters
         self.samples = samples
         self.spans = spans
@@ -1417,7 +1490,8 @@ class Telemetry:
         聚合、跨度、时钟配置与容量上限保持不变，输入对象也不被改写；解析
         阶段已切断与 payload 的引用，合并后的数据不与 payload 或其中的列表、
         标签共享可变对象。容量检查在校验阶段完成，不读取 clock；跨度不占
-        配额。
+        配额。样本保留上限沿用当前实例的设置：同一序列按分片顺序追加后只
+        保留最新的 N 个原值。
         """
         data = self._restore_parse(payload)
         counters, samples, spans = self._restore_validate(data)
@@ -1443,7 +1517,8 @@ class Telemetry:
         TelemetryCapacityError），全部通过后才一次性提交。任何失败都使
         当前实例的计数器、样本、跨度、时钟配置与容量上限保持调用前状态；
         全程不读取 clock、不修改输入，合并后的数据不与任何 payload 共享
-        可变对象。
+        可变对象。样本保留上限沿用当前实例的设置：同一序列按 payloads
+        顺序追加后只保留最新的 N 个原值。
         """
         if not isinstance(payloads, (list, tuple)):
             raise ValueError("payloads must be a list or tuple of snapshots")
@@ -1502,6 +1577,10 @@ class Telemetry:
                         )
                 else:
                     merged_spans[key] = record
+        # 合并完成后按分片追加顺序应用样本保留上限：同一序列只保留最新
+        # 窗口，与按相同事件顺序逐条 observe 的结果一致。统一用赋值替换，
+        # 绝不原地修改 self 或分片中的列表对象。
+        self._trim_all_sample_series(merged_samples)
         return merged_counters, merged_samples, merged_spans
 
     # ------------------------------------------------------------------
