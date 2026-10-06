@@ -1005,6 +1005,87 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def sample_summary(self, name, labels=None, service=None):
+        """离线诊断：一次汇总同名的多条已记录样本序列，只读不改状态。
+
+        name 必须可哈希，不可哈希统一抛 ValueError。service 省略或显式 None
+        匹配全部服务；提供时只能是字符串，按快照筛选语义精确匹配，空字符串
+        表示默认服务；其他类型一律 ValueError。labels 省略或显式 None 匹配
+        全部完整标签集合；提供时沿用 observe 的成对输入、键排序、重复键拒绝
+        与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空序列只
+        匹配无标签样本）。全部参数校验先于任何样本读取完成：不读 clock、不
+        产生部分结果、不修改聚合状态与输入标签。
+
+        命中序列的选取与排序和快照完全一致：先按快照对服务、名称、标签的
+        现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配且 values
+        非空的序列（空 values 序列不参与汇总）。每条序列内部沿用 values 的
+        写入顺序，把所有值按公开有限浮点规则转换后合并：任一历史值无法
+        转换为有限数值，或转换过程出现异常（含超大整数溢出与自定义
+        __float__ 异常），统一抛 ValueError；全部值先完成转换才形成结果，
+        绝不返回部分字典。
+
+        成功返回全新字典，只含 series_count、count、sum、minimum、maximum、
+        mean：series_count 是参与汇总的非空序列数；count 是实际值总数；
+        sum 自 0.0 起按上述确定顺序累加；minimum/maximum 为全体数值的
+        最小/最大值；mean 等于 sum 除以 count。两个计数字段为 Python int，
+        其余统计字段为 Python float。没有匹配的非空序列（因而也没有可保留
+        值）时返回 None。整个过程纯只读：不联网、不调用 clock、不修改
+        聚合器、输入标签或既有 values，不写入 snapshot/json/digest 或恢复
+        载荷，也不新增快照字段；返回结果可安全修改，重复调用结果一致。
+        """
+        # 全部入站校验先于样本读取：name 可哈希；service 沿用快照筛选语义
+        # （None 全部服务、字符串精确匹配、空串为默认服务，其他类型拒绝）；
+        # labels 省略/None 匹配全部标签集合，提供时按 observe 规则归一化。
+        self._restore_hashable(name, "name")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 先按快照对 (service, name, labels) 的稳定顺序排列全部序列，再按
+        # 名称与筛选挑出非空序列：相对顺序与同条件快照中同名条目逐项一致。
+        ordered_keys = [
+            key
+            for key, _ in sorted(
+                self.samples.items(),
+                key=lambda item: _OrderableTuple(item[0]),
+            )
+        ]
+        selected = []
+        for svc, key_name, key_labels in ordered_keys:
+            try:
+                matches = (
+                    key_name == name
+                    and (service is None or svc == service)
+                    and (labels is None or key_labels == labels)
+                )
+            except Exception as exc:
+                # 自定义标识的比较异常同样属于入参非法，统一为 ValueError。
+                raise ValueError("invalid sample_summary selector: %s" % (exc,))
+            if matches:
+                values = self.samples[(svc, key_name, key_labels)]
+                if values:  # 只有非空序列参与汇总
+                    selected.append(values)
+        # 序列顺序来自快照排序，序列内部沿用 values 写入顺序。全部值先按
+        # 公开有限浮点规则转换完才形成结果：任一转换失败统一 ValueError
+        # （_finite_float 已把底层各类异常归一），不返回部分结果。
+        numbers = []
+        for values in selected:
+            for value in values:
+                numbers.append(self._finite_float(value))
+        if not numbers:  # 没有匹配的非空序列或没有可保留值：无统计可言
+            return None
+        total = 0.0
+        for number in numbers:  # 自 0.0 按确定顺序累加
+            total += number
+        count = len(numbers)
+        return {
+            "series_count": len(selected),
+            "count": count,
+            "sum": total,
+            "minimum": min(numbers),
+            "maximum": max(numbers),
+            "mean": total / count,
+        }
+
     def span_duration_stats(self, service=None, labels=None, status="closed"):
         """离线诊断：对已结束跨度的耗时（end 减 start）做汇总，只读不改状态。
 

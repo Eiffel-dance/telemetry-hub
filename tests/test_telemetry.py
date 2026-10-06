@@ -3386,5 +3386,229 @@ class TelemetryCapacityTest(unittest.TestCase):
         self.assertEqual(t.digest(), snap_digest)
 
 
+class TelemetrySampleSummaryTest(unittest.TestCase):
+    def _build(self):
+        t = Telemetry()
+        # 默认服务、无标签序列：2 个值
+        t.observe("lat", 1)
+        t.observe("lat", 2)
+        # 默认服务、带标签序列：2 个值
+        t.observe("lat", 4, labels=(("k", "v"),))
+        t.observe("lat", 8, labels=(("k", "v"),))
+        # api 服务、无标签序列：3 个值
+        t.observe("lat", 16, service="api")
+        t.observe("lat", 32, service="api")
+        t.observe("lat", 64, service="api")
+        # 其他名称不应混入
+        t.observe("other", 100)
+        t.observe("other", 200, service="api")
+        return t
+
+    def test_aggregates_all_same_name_series_in_snapshot_order(self):
+        t = self._build()
+        summary = t.sample_summary("lat")
+        # 期望值按快照稳定顺序（服务、名称、标签）逐序列、序列内按写入顺序合并
+        ordered_values = []
+        for record in t.snapshot()["samples"]:
+            if record["name"] == "lat":
+                ordered_values.extend(record["values"])
+        self.assertEqual(len(ordered_values), 7)
+        total = 0.0
+        for value in ordered_values:
+            total += value
+        self.assertEqual(
+            summary,
+            {
+                "series_count": 3,
+                "count": 7,
+                "sum": total,
+                "minimum": 1.0,
+                "maximum": 64.0,
+                "mean": total / 7,
+            },
+        )
+        self.assertIsInstance(summary["series_count"], int)
+        self.assertIsInstance(summary["count"], int)
+        for key in ("sum", "minimum", "maximum", "mean"):
+            self.assertIsInstance(summary[key], float)
+        self.assertEqual(set(summary), {
+            "series_count", "count", "sum", "minimum", "maximum", "mean"
+        })
+
+    def test_service_filter_none_empty_and_named(self):
+        t = self._build()
+        all_summary = t.sample_summary("lat", service=None)
+        self.assertEqual(all_summary["series_count"], 3)
+        self.assertEqual(all_summary["count"], 7)
+        # 省略 service 与显式 None 等价
+        self.assertEqual(t.sample_summary("lat"), all_summary)
+        # 空字符串精确匹配默认服务：无标签与带标签两个序列
+        default_summary = t.sample_summary("lat", service="")
+        self.assertEqual(default_summary["series_count"], 2)
+        self.assertEqual(default_summary["count"], 4)
+        self.assertEqual(default_summary["minimum"], 1.0)
+        self.assertEqual(default_summary["maximum"], 8.0)
+        # 具名服务精确匹配
+        api_summary = t.sample_summary("lat", service="api")
+        self.assertEqual(api_summary["series_count"], 1)
+        self.assertEqual(api_summary["count"], 3)
+        self.assertEqual(api_summary["sum"], 112.0)
+        self.assertEqual(api_summary["minimum"], 16.0)
+        self.assertEqual(api_summary["maximum"], 64.0)
+        self.assertIsNone(t.sample_summary("lat", service="web"))
+        for bad in (1, 1.5, b"api", ["api"], object()):
+            with self.assertRaises(ValueError):
+                t.sample_summary("lat", service=bad)
+
+    def test_labels_filter_none_empty_and_specific(self):
+        t = self._build()
+        # None 匹配全部标签集合
+        self.assertEqual(t.sample_summary("lat", labels=None)["count"], 7)
+        # 显式空序列只匹配无标签样本：默认服务与 api 各一条
+        unlabeled = t.sample_summary("lat", labels=())
+        self.assertEqual(unlabeled["series_count"], 2)
+        self.assertEqual(unlabeled["count"], 5)
+        self.assertEqual(unlabeled["minimum"], 1.0)
+        self.assertEqual(unlabeled["maximum"], 64.0)
+        # 具名标签按归一化后的完整集合精确匹配
+        tagged = t.sample_summary("lat", labels=(("k", "v"),))
+        self.assertEqual(tagged["series_count"], 1)
+        self.assertEqual(tagged["count"], 2)
+        self.assertEqual(tagged["sum"], 12.0)
+        # 标签输入顺序不影响匹配
+        t.observe("lat2", 3, labels=(("a", 1), ("b", 2)))
+        self.assertEqual(
+            t.sample_summary("lat2", labels=(("b", 2), ("a", 1)))["count"], 1
+        )
+        # 没有该标签集合时返回 None
+        self.assertIsNone(t.sample_summary("lat", labels=(("k", "x"),)))
+        # 重复键、不可严格 JSON 序列化的值统一 ValueError
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat", labels=(("k", 1), ("k", 2)))
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat", labels=(("k", float("nan")),))
+
+    def test_service_and_labels_filter_combined(self):
+        t = self._build()
+        summary = t.sample_summary(
+            "lat", labels=(), service="api"
+        )
+        self.assertEqual(summary["series_count"], 1)
+        self.assertEqual(summary["count"], 3)
+        self.assertIsNone(t.sample_summary("lat", labels=(("k", "v"),), service="api"))
+        self.assertIsNone(t.sample_summary("lat", labels=(), service="web"))
+
+    def test_missing_name_and_empty_series_return_none(self):
+        t = self._build()
+        self.assertIsNone(t.sample_summary("nope"))
+        # 空聚合器
+        self.assertIsNone(Telemetry().sample_summary("lat"))
+        # 同名序列存在但全部为空（max_values_per_series=0）不参与汇总
+        trimmed = Telemetry(max_values_per_series=0)
+        trimmed.observe("lat", 1)
+        trimmed.observe("lat", 2, service="api")
+        self.assertEqual(trimmed.sample_summary("lat"), None)
+        # 一条非空加一条空：只统计非空序列
+        mixed = Telemetry(max_values_per_series=1)
+        mixed.observe("lat", 1)
+        mixed.observe("lat", 2)  # 窗口只保留 [2]
+        mixed.samples[("api", "lat", ())] = []  # 直接构造空序列
+        summary = mixed.sample_summary("lat")
+        self.assertEqual(summary["series_count"], 1)
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["sum"], 2.0)
+
+    def test_unhashable_name_rejected_before_reading_samples(self):
+        t = self._build()
+        with self.assertRaises(ValueError):
+            t.sample_summary(["lat"])
+        with self.assertRaises(ValueError):
+            t.sample_summary({"a": 1})
+
+    def test_validation_before_read_and_no_partial_result(self):
+        # 不可转换的历史值：统一 ValueError，不返回部分字典
+        t = Telemetry()
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        t.samples[("web", "lat", ())] = [4, object()]
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat")
+        # 超大整数溢出同样归一为 ValueError
+        t.samples[("web", "lat", ())] = [10 ** 400]
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat")
+        # 自定义 __float__ 抛异常也统一为 ValueError
+        class ExplodingValue:
+            def __float__(self):
+                raise RuntimeError("boom")
+
+        t.samples[("web", "lat", ())] = [ExplodingValue()]
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat")
+        # 非法参数先于历史值转换：坏 service + 坏数据并存时仍是参数 ValueError
+        with self.assertRaises(ValueError):
+            t.sample_summary("lat", service=123)
+
+    def test_does_not_read_clock_or_mutate_state(self):
+        class BoomClock:
+            def __call__(self):
+                raise AssertionError("clock must not be called")
+
+        t = Telemetry(BoomClock())
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        before = t.snapshot()
+        before_digest = t.digest()
+        summary = t.sample_summary("lat")
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.digest(), before_digest)
+        # 输入标签不被修改
+        labels = [("b", 2), ("a", 1)]
+        t.observe("tagged", 5, labels=labels)
+        t.sample_summary("tagged", labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+
+    def test_result_is_independent_and_repeatable(self):
+        t = self._build()
+        first = t.sample_summary("lat")
+        second = t.sample_summary("lat")
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        first["count"] = 999
+        first["extra"] = "x"
+        third = t.sample_summary("lat")
+        self.assertEqual(third["count"], 7)
+        self.assertNotIn("extra", third)
+
+    def test_sum_order_is_snapshot_order_then_write_order(self):
+        # 两个序列的值各自按写入顺序；序列之间按快照（服务、名称、标签）顺序
+        t = Telemetry()
+        t.observe("lat", 0.1, service="b")
+        t.observe("lat", 0.2, service="b")
+        t.observe("lat", 0.3)  # 默认服务排在 b 之前
+        ordered = [0.3, 0.1, 0.2]
+        expected_sum = 0.0
+        for value in ordered:
+            expected_sum += value
+        summary = t.sample_summary("lat")
+        self.assertEqual(summary["series_count"], 2)
+        # 逐位相同：累加顺序必须确定
+        self.assertEqual(summary["sum"].hex(), expected_sum.hex())
+        self.assertEqual(summary["mean"], expected_sum / 3)
+
+    def test_works_after_restore_and_does_not_change_snapshot_fields(self):
+        t = self._build()
+        payload = t.json()
+        restored = Telemetry.restore(payload)
+        self.assertEqual(
+            restored.sample_summary("lat"), t.sample_summary("lat")
+        )
+        # 快照样本条目字段形状不新增任何内容
+        for record in restored.snapshot()["samples"]:
+            self.assertNotIn("series_count", record)
+        self.assertEqual(restored.digest(), t.digest())
+
+
 if __name__ == "__main__":
     unittest.main()
