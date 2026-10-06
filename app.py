@@ -758,6 +758,126 @@ class Telemetry:
 
         return build(span, record)
 
+    def trace_summary(self, span, service=None):
+        """离线诊断：对一个跨度子树做只读汇总，返回统计字典。
+
+        service 归一化规则与 start/finish/trace 一致（缺省为默认服务，显式
+        传入必须是非空字符串），跨度标识不可哈希时抛 ValueError；任一校验
+        失败都发生在读取任何跨度之前。根跨度不存在返回 None。
+
+        可达集合与 trace 完全相同：从根跨度出发，只沿同一服务内 parent 与
+        当前跨度标识精确相等的关系纳入后代，父标识指向其他服务或不存在的
+        跨度（含不可哈希标识）按无子节点忽略；每个可达跨度只统计一次，顺
+        序沿用 trace 的稳定顺序（先根跨度，每层子跨度按服务、开始时间、
+        标识排序后深度优先）。可达子树中父子引用构成环时抛 ValueError，
+        不返回部分结果。
+
+        返回与内部状态隔离的全新字典，固定包含：span（根跨度标识）、
+        service（归一化后的服务）、span_count（全部可达跨度数）、
+        open_count（end 为空）与 closed_count（end 已写入，成功与带异常
+        结束都包含）、error_count（已结束且 error 不为 None，0、False、
+        空容器等假值也不例外）、durations（仅已结束跨度的耗时，按同一
+        稳定顺序排列）、duration_sum、duration_min、duration_max、
+        duration_mean。没有已结束跨度时 durations 为空、duration_sum 为
+        0.0，duration_min/duration_max/duration_mean 均为 None；否则
+        duration_sum 自 0.0 起按顺序累加，duration_mean 为总和除以数量。
+
+        每个已结束跨度的 start 与 end 各自按现有样本统计的有限浮点规则
+        转换后相减（float(end) - float(start)）：转换失败、超大整数溢出、
+        自定义 __float__ 抛异常或结果为 NaN、无穷都统一抛 ValueError，
+        且全部转换完成后再汇总，不返回部分结果；未结束跨度不参与转换，
+        其时间戳不会被读取。整个过程纯只读：不读取 clock、不联网、不改变
+        计数器、样本、跨度或调用方对象；返回字典与 durations 列表均为全新
+        对象，可安全修改，重复调用结果一致。汇总字段不写入
+        snapshot/json/digest/diff_snapshots 的任何输出。
+        """
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        record = self.spans.get((service, span))
+        if record is None:
+            return None
+
+        # 与 trace 相同的同服务 parent -> 子跨度预索引：其他服务的跨度即使
+        # 父标识相同也不属于本子树；不可哈希的父标识无法精确等于任何跨度键。
+        children_by_parent = {}
+        for (child_service, child_span), child_record in self.spans.items():
+            if child_service != service:
+                continue
+            parent = child_record["parent"]
+            try:
+                children_by_parent.setdefault(parent, []).append(child_span)
+            except TypeError:
+                continue
+
+        visited = set()
+        ordered = []  # 可达跨度记录，按 trace 的稳定顺序收集
+
+        def walk(node_span):
+            key = (service, node_span)
+            if key in visited:  # 每个跨度只有一个父标识，重复到达即成环
+                raise ValueError("cycle detected in span parent references")
+            visited.add(key)
+            node_record = self.spans[key]
+            ordered.append(node_record)
+            children = [
+                (child_span, self.spans[(service, child_span)])
+                for child_span in children_by_parent.get(node_span, ())
+            ]
+            children.sort(
+                key=lambda item: _OrderableTuple(
+                    (service, item[1]["start"], item[0])
+                )
+            )
+            for child_span, _child_record in children:
+                walk(child_span)
+
+        walk(span)
+
+        open_count = 0
+        error_count = 0
+        closed_records = []
+        for item in ordered:
+            if item["end"] is None:
+                open_count += 1
+            else:
+                closed_records.append(item)
+                if item["error"] is not None:
+                    error_count += 1
+        # 全部已结束跨度的起止时间先按样本统计的公开浮点规则转换：任一
+        # 无法转为有限数值即统一 ValueError（含超大整数溢出与自定义
+        # __float__ 异常），先转换完再汇总，保证不会边统计边失败而产生
+        # 部分结果。耗时为 end 的 float 减 start 的 float。
+        durations = []
+        for item in closed_records:
+            started_at = self._finite_float(item["start"])
+            ended_at = self._finite_float(item["end"])
+            durations.append(ended_at - started_at)
+        if durations:
+            duration_sum = 0.0
+            for number in durations:  # 按稳定顺序累加，与样本统计一致
+                duration_sum += number
+            duration_min = min(durations)
+            duration_max = max(durations)
+            duration_mean = duration_sum / len(durations)
+        else:
+            duration_sum = 0.0
+            duration_min = None
+            duration_max = None
+            duration_mean = None
+        return {
+            "span": span,
+            "service": service,
+            "span_count": len(ordered),
+            "open_count": open_count,
+            "closed_count": len(closed_records),
+            "error_count": error_count,
+            "durations": durations,
+            "duration_sum": duration_sum,
+            "duration_min": duration_min,
+            "duration_max": duration_max,
+            "duration_mean": duration_mean,
+        }
+
     @staticmethod
     def _check_percentile_q(q):
         # 只接受非 bool 的 int/float：bool 是 int 的子类，必须显式排除；
