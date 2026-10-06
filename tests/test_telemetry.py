@@ -2947,5 +2947,224 @@ class TelemetrySpansByDurationTest(unittest.TestCase):
         )
 
 
+class TelemetryCapacityTest(unittest.TestCase):
+    def test_error_type_is_public_valueerror_subclass(self):
+        from app import TelemetryCapacityError
+        self.assertTrue(issubclass(TelemetryCapacityError, ValueError))
+        with self.assertRaises(ValueError):
+            raise TelemetryCapacityError("boom")
+
+    def test_max_series_validation(self):
+        from app import TelemetryCapacityError  # noqa: F401
+        # None（缺省）与非负整数合法
+        Telemetry()
+        Telemetry(max_series=None)
+        Telemetry(max_series=0)
+        Telemetry(max_series=3)
+        for bad in (True, False, -1, 1.5, 2.0, "3", [], object()):
+            with self.assertRaises(ValueError):
+                Telemetry(max_series=bad)
+
+    def test_unlimited_by_default(self):
+        t = Telemetry()
+        for i in range(50):
+            t.inc("c%d" % i)
+            t.observe("s%d" % i, 1)
+        self.assertEqual(
+            t.capacity, {"limit": None, "used": 100, "remaining": None}
+        )
+
+    def test_new_series_rejected_at_limit_state_unchanged(self):
+        t = Telemetry(max_series=2)
+        t.inc("a")
+        t.observe("b", 1.0)
+        self.assertEqual(
+            t.capacity, {"limit": 2, "used": 2, "remaining": 0}
+        )
+        before = t.snapshot()
+        with self.assertRaises(ValueError):
+            t.inc("c")
+        with self.assertRaises(ValueError):
+            t.observe("d", 1.0)
+        # 已有序列的更新照常执行
+        t.inc("a", 5)
+        t.observe("b", 2.0)
+        snap = t.snapshot()
+        self.assertEqual(len(snap["counters"]), 1)
+        self.assertEqual(len(snap["samples"]), 1)
+        self.assertEqual(snap["counters"][0]["value"], 6)
+        self.assertEqual(snap["samples"][0]["values"], [1.0, 2.0])
+        # 拒绝没有引入新序列
+        self.assertEqual(
+            {c["name"] for c in snap["counters"]},
+            {c["name"] for c in before["counters"]},
+        )
+
+    def test_counter_and_sample_same_name_count_separately(self):
+        t = Telemetry(max_series=2)
+        t.inc("x", labels=(("k", "v"),))
+        t.observe("x", 1, labels=(("k", "v"),))
+        self.assertEqual(t.capacity["used"], 2)
+        with self.assertRaises(ValueError):
+            t.inc("x", labels=(("k", "w"),))
+
+    def test_zero_limit_rejects_any_new_series(self):
+        t = Telemetry(max_series=0)
+        with self.assertRaises(ValueError):
+            t.inc("a")
+        with self.assertRaises(ValueError):
+            t.observe("a", 1)
+        self.assertEqual(t.capacity["used"], 0)
+        self.assertEqual(t.snapshot(), {"counters": [], "samples": [], "spans": []})
+
+    def test_spans_do_not_consume_quota(self):
+        t = Telemetry(iter(range(100)).__next__, max_series=1)
+        t.start("s1", labels=(("k", "v"),))
+        t.finish("s1")
+        t.start("s2")
+        t.finish("s2")
+        self.assertEqual(t.capacity["used"], 0)
+        t.inc("only")
+        with self.assertRaises(ValueError):
+            t.observe("other", 1)
+
+    def test_capacity_view_is_independent_and_repeatable(self):
+        t = Telemetry(max_series=5)
+        t.inc("a")
+        first = t.capacity
+        first["used"] = 999
+        first["limit"] = None
+        self.assertEqual(
+            t.capacity, {"limit": 5, "used": 1, "remaining": 4}
+        )
+        self.assertEqual(t.capacity, t.capacity)
+        # 兼容无参方法式访问
+        self.assertEqual(t.capacity(), dict(t.capacity))
+
+    def test_capacity_not_in_snapshot_or_json(self):
+        t = Telemetry(max_series=3)
+        t.inc("a")
+        snap = t.snapshot()
+        self.assertEqual(set(snap), {"counters", "samples", "spans"})
+        payload = json.loads(t.json())
+        self.assertEqual(set(payload), {"counters", "samples", "spans"})
+        self.assertNotIn("capacity", json.dumps(payload))
+
+    def test_batch_capacity_rejection_is_atomic_and_clock_free(self):
+        reads = []
+        t = Telemetry(lambda: reads.append(1) or 0.0, max_series=2)
+        t.inc("a")
+        before = t.snapshot()
+        events = [
+            {"op": "inc", "name": "b"},
+            {"op": "observe", "name": "c", "value": 1},
+            {"op": "start", "span": "s"},
+            {"op": "finish", "span": "s"},
+        ]
+        with self.assertRaises(ValueError):
+            t.batch(events)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(reads, [])  # 校验阶段不读 clock
+        self.assertEqual(t.query("open"), [])
+        # 恰好达到上限的批次可以提交
+        t.batch([{"op": "inc", "name": "b"}])
+        self.assertEqual(t.capacity["used"], 2)
+        with self.assertRaises(ValueError):
+            t.batch([{"op": "inc", "name": "c"}])
+        self.assertEqual(t.capacity["used"], 2)
+
+    def test_restore_snapshot_capacity_checked_atomically(self):
+        source = Telemetry()
+        source.inc("a")
+        source.inc("b")
+        source.observe("c", 1)
+        payload = source.snapshot()
+
+        t = Telemetry(max_series=2)
+        t.inc("keep")
+        before = t.snapshot()
+        with self.assertRaises(ValueError):
+            t.restore_snapshot(payload)
+        self.assertEqual(t.snapshot(), before)
+        # 上限足够时恢复成功，且上限沿用当前实例
+        ok = Telemetry(max_series=3)
+        self.assertIsNone(ok.restore_snapshot(payload))
+        self.assertEqual(ok.capacity["used"], 3)
+        with self.assertRaises(ValueError):
+            ok.inc("new")
+        # 无限制实例不受影响
+        free = Telemetry()
+        self.assertIsNone(free.restore_snapshot(payload))
+        self.assertIsNone(free.capacity["limit"])
+
+    def test_merge_snapshot_capacity_checked_atomically(self):
+        shard = Telemetry()
+        shard.inc("x")
+        shard.observe("y", 1)
+        t = Telemetry(max_series=2)
+        t.inc("mine")
+        before = t.snapshot()
+        with self.assertRaises(ValueError):
+            t.merge_snapshot(shard.snapshot())
+        self.assertEqual(t.snapshot(), before)
+        with self.assertRaises(ValueError):
+            t.merge_snapshots([shard.snapshot()])
+        self.assertEqual(t.snapshot(), before)
+        # 合并不引入新序列时照常成功
+        same = Telemetry()
+        same.inc("mine", 2)
+        self.assertIsNone(t.merge_snapshot(same.snapshot()))
+        self.assertEqual(t.capacity["used"], 1)
+        # 上限足够时合并成功
+        roomy = Telemetry(max_series=3)
+        roomy.inc("mine")
+        self.assertIsNone(roomy.merge_snapshots([shard.snapshot()]))
+        self.assertEqual(roomy.capacity["used"], 3)
+
+    def test_merge_snapshots_format_error_still_snapshot_format_error(self):
+        t = Telemetry(max_series=1)
+        with self.assertRaises(SnapshotFormatError):
+            t.merge_snapshots([{"counters": [], "samples": []}])
+        with self.assertRaises(SnapshotFormatError):
+            t.restore_snapshot("not json")
+
+    def test_restore_and_from_snapshot_accept_max_series(self):
+        source = Telemetry()
+        source.inc("a")
+        source.inc("b")
+        payload = source.json()
+        # 恢复结果超限：抛 TelemetryCapacityError
+        from app import TelemetryCapacityError
+        with self.assertRaises(TelemetryCapacityError):
+            Telemetry.restore(payload, max_series=1)
+        with self.assertRaises(TelemetryCapacityError):
+            Telemetry.from_snapshot(payload, max_series=1)
+        # 上限足够：恢复成功，后续写入与全量记录的容量判定一致
+        restored = Telemetry.restore(payload, max_series=3)
+        self.assertEqual(restored.capacity["used"], 2)
+        restored.inc("c")
+        with self.assertRaises(ValueError):
+            restored.observe("d", 1)
+        full = Telemetry(max_series=3)
+        full.inc("a")
+        full.inc("b")
+        full.inc("c")
+        self.assertEqual(restored.snapshot(), full.snapshot())
+        self.assertEqual(restored.capacity, full.capacity)
+        # 缺省无上限
+        self.assertIsNone(Telemetry.restore(payload).capacity["limit"])
+        self.assertIsNone(Telemetry.from_snapshot(payload).capacity["limit"])
+
+    def test_capacity_error_is_valueerror_for_existing_catchers(self):
+        t = Telemetry(max_series=1)
+        t.inc("a")
+        try:
+            t.inc("b")
+        except ValueError as exc:
+            self.assertEqual(type(exc).__name__, "TelemetryCapacityError")
+        else:
+            self.fail("expected ValueError")
+
+
 if __name__ == "__main__":
     unittest.main()

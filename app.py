@@ -155,12 +155,95 @@ class SnapshotFormatError(ValueError):
     """
 
 
+class TelemetryCapacityError(ValueError):
+    """指标序列容量超限的公开异常类型。
+
+    实例设置了 max_series 上限时，任何会导致计数器/样本序列总数超过上限
+    的写入（inc/observe 首次写入新序列，或 batch/restore_snapshot/
+    merge_snapshot/merge_snapshots 整体超限）统一抛出本异常。它是
+    ValueError 的子类，既有按 ValueError 捕获的调用方行为不变；拒绝发生
+    在修改聚合或读取 clock 之前，原有数据、输入对象与后续快照保持不变。
+    """
+
+
+class _CapacityView(dict):
+    """capacity 入口返回的独立字典。
+
+    内容与普通 dict 完全一致（固定含 limit/used/remaining），每次访问都
+    重新构造，与内部状态互不共享；额外允许以调用形式再取一次独立副本，
+    兼容把入口当作无参方法使用的习惯。
+    """
+
+    __slots__ = ()
+
+    def __call__(self):
+        return dict(self)
+
+
 class Telemetry:
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, max_series=None):
+        # max_series 省略或传入 None 表示不设上限；其余值必须是非 bool 的
+        # 非负整数，非法容量参数统一抛 ValueError，实例不会建成。
         self.clock = clock
+        self._max_series = self._check_max_series(max_series)
         self.counters = {}
         self.samples = {}
         self.spans = {}
+
+    @staticmethod
+    def _check_max_series(max_series):
+        # None 表示不设上限；bool 是 int 的子类必须显式排除，float、字符
+        # 串等其他类型与负整数一律拒绝。
+        if max_series is None:
+            return None
+        if isinstance(max_series, bool) or not isinstance(max_series, int):
+            raise ValueError(
+                "max_series must be None or a non-bool non-negative integer,"
+                " got %r" % (max_series,)
+            )
+        if max_series < 0:
+            raise ValueError(
+                "max_series must be non-negative, got %r" % (max_series,)
+            )
+        return max_series
+
+    @property
+    def capacity(self):
+        """只读的指标序列容量视图，返回独立字典，不读 clock、不写快照。
+
+        固定含 limit（上限，无限制为 None）、used（已用序列数，计数器与
+        样本按类型分别计数，跨度不占配额）与 remaining（剩余配额，无限制
+        为 None）。每次访问都重新构造，重复访问结果一致，修改返回字典不
+        影响聚合器；容量信息不进入 snapshot()/json()。
+        """
+        used = len(self.counters) + len(self.samples)
+        limit = self._max_series
+        remaining = None if limit is None else limit - used
+        return _CapacityView(limit=limit, used=used, remaining=remaining)
+
+    def _check_state_capacity(self, counters, samples):
+        # batch/restore/merge 共用的整体容量校验：结果状态的序列总数（计数
+        # 器与样本分别计数，跨度不占配额）超过当前上限即整体抛
+        # TelemetryCapacityError；调用方保证校验通过前不提交任何状态，
+        # 校验本身不读 clock。
+        limit = self._max_series
+        if limit is not None and len(counters) + len(samples) > limit:
+            raise TelemetryCapacityError(
+                "metric series capacity exceeded: limit=%d, series=%d"
+                % (limit, len(counters) + len(samples))
+            )
+
+    def _check_new_series_capacity(self, namespace, key):
+        # inc/observe 写入前的单序列校验：已有序列的更新照常放行；首次写入
+        # 新序列且达到上限时抛 TelemetryCapacityError，拒绝发生在任何聚合
+        # 修改之前（inc/observe 本就不读 clock），原有数据与输入对象不变。
+        limit = self._max_series
+        if limit is None or key in namespace:
+            return
+        if len(self.counters) + len(self.samples) + 1 > limit:
+            raise TelemetryCapacityError(
+                "metric series capacity exceeded: limit=%d" % (limit,)
+            )
 
     @staticmethod
     def _service(service):
@@ -199,12 +282,14 @@ class Telemetry:
     def inc(self, name, value=1, labels=(), service=None):
         service = self._service(service)
         labels = self._normalize_labels(labels)
+        self._check_new_series_capacity(self.counters, (service, name, labels))
         self._apply_inc(self.counters, service, name, value, labels)
 
     def observe(self, name, value, labels=(), service=None):
         service = self._service(service)
         labels = self._normalize_labels(labels)
         self._check_sample_value(value)
+        self._check_new_series_capacity(self.samples, (service, name, labels))
         self._apply_observe(self.samples, service, name, value, labels)
 
     @staticmethod
@@ -335,6 +420,9 @@ class Telemetry:
         全部通过后才在状态副本上按计划提交并一次性发布，提交阶段
         clock 自身抛出的异常原样传播，counter/sample/span 与 clock
         配置保持调用前状态。传入的事件对象及其标签、值均不被修改。
+        实例设置 max_series 时，批次引入的新序列使序列总数超限即整体
+        抛 TelemetryCapacityError，拒绝判定同样在计划阶段完成、不读
+        clock，聚合与 clock 配置保持调用前状态。
         """
         if not isinstance(events, (list, tuple)):
             raise ValueError("events must be a list or tuple of event objects")
@@ -454,6 +542,10 @@ class Telemetry:
                 raise ValueError(
                     "event at index %d is invalid: %s" % (index, exc)
                 )
+        # 容量校验在计划阶段完成：任一新序列导致序列总数超限即整体抛
+        # TelemetryCapacityError，此阶段不读 clock、不触碰 self 的聚合，
+        # 影子状态随异常丢弃，提交阶段不会执行。
+        self._check_state_capacity(counters, samples)
         return actions
 
     @staticmethod
@@ -1171,17 +1263,20 @@ class Telemetry:
     _STATS_KEYS = ("count", "sum", "minimum", "maximum", "mean")
 
     @classmethod
-    def from_snapshot(cls, payload, clock=time.time):
+    def from_snapshot(cls, payload, clock=time.time, max_series=None):
         """把 snapshot() 字典或 json() 文本重建为独立的 Telemetry 实例。
 
         全程不联网、不读写文件、不修改输入；任何缺失/多余字段、非法 JSON、
         重复记录、统计不一致、无效标签、不可哈希标识等内容一律抛
         SnapshotFormatError（ValueError 的子类），且不会在抛出前留下半成品
-        实例或改动任何已有实例。
+        实例或改动任何已有实例。可传入 max_series 为新实例设置序列容量上限
+        （省略或 None 表示不设上限），恢复出的序列总数超过上限时抛
+        TelemetryCapacityError。
         """
+        instance = cls(clock, max_series=max_series)
         data = cls._restore_parse(payload)
         counters, samples, spans = cls._restore_validate(data)
-        instance = cls(clock)
+        instance._check_state_capacity(counters, samples)
         instance.counters = counters
         instance.samples = samples
         instance.spans = spans
@@ -1243,7 +1338,7 @@ class Telemetry:
                 color[item] = 2
 
     @classmethod
-    def restore(cls, payload, clock=time.time):
+    def restore(cls, payload, clock=time.time, max_series=None):
         """严格恢复一份快照为可继续记录的新实例（离线续采）。
 
         接受 snapshot() 字典、json() 文本或 UTF-8 字节；顶层在 counters、
@@ -1255,10 +1350,14 @@ class Telemetry:
         联网、不读写文件、不修改输入。恢复后的实例保留服务与标签维度、计数
         值、样本原值与公开浮点统计、每个跨度的开始/结束状态、异常信息与父
         跨度关系，可继续用 inc/observe/start/finish 记录，随后生成的快照与
-        从同一事件序列全量记录得到的快照字段值与稳定排序一致。
+        从同一事件序列全量记录得到的快照字段值与稳定排序一致。可传入
+        max_series 为新实例设置序列容量上限（省略或 None 表示不设上限），
+        恢复出的序列总数超过上限时抛 TelemetryCapacityError，不留下半成品
+        实例；上限生效后继续写入与全量记录的容量判定一致。
         """
+        instance = cls(clock, max_series=max_series)
         counters, samples, spans = cls._restore_strict_state(payload)
-        instance = cls(clock)
+        instance._check_state_capacity(counters, samples)
         instance.counters = counters
         instance.samples = samples
         instance.spans = spans
@@ -1271,9 +1370,12 @@ class Telemetry:
         先完整解析、校验并构建全新状态，最后一次性替换 counters/samples/
         spans：任何 SnapshotFormatError 都使当前实例的聚合、跨度与时钟配置
         保持调用前状态，输入对象不被改写，恢复后的数据不与 payload 共享可
-        变对象。空快照得到可继续使用的空聚合器。
+        变对象。空快照得到可继续使用的空聚合器。实例沿用当前 max_series
+        上限：恢复出的序列总数超过上限时整体抛 TelemetryCapacityError，
+        聚合、跨度与时钟配置保持调用前状态，校验阶段不读 clock。
         """
         counters, samples, spans = self._restore_strict_state(payload)
+        self._check_state_capacity(counters, samples)
         self.counters = counters
         self.samples = samples
         self.spans = spans
@@ -1293,11 +1395,14 @@ class Telemetry:
         ValueError，当前实例的全部聚合、
         跨度与时钟配置保持不变，输入对象也不被改写；解析阶段已切断与
         payload 的引用，合并后的数据不与 payload 或其中的列表、标签共享
-        可变对象。
+        可变对象。实例沿用当前 max_series 上限：合并结果中任一新序列导致
+        序列总数超限即整体抛 TelemetryCapacityError，聚合、跨度与时钟配置
+        保持调用前状态，校验阶段不读 clock。
         """
         data = self._restore_parse(payload)
         counters, samples, spans = self._restore_validate(data)
         merged = self._merged_state(((counters, samples, spans),))
+        self._check_state_capacity(merged[0], merged[1])
         self.counters, self.samples, self.spans = merged
         return None
 
@@ -1316,7 +1421,9 @@ class Telemetry:
         冲突检查（计数器不可相加或同键跨度不一致抛 ValueError），全部
         通过后才一次性提交。任何失败都使当前实例的计数器、样本、跨度和
         时钟配置保持调用前状态；全程不读取 clock、不修改输入，合并后的
-        数据不与任何 payload 共享可变对象。
+        数据不与任何 payload 共享可变对象。实例沿用当前 max_series 上限：
+        合并结果中任一新序列导致序列总数超限即整体抛
+        TelemetryCapacityError，状态保持调用前不变。
         """
         if not isinstance(payloads, (list, tuple)):
             raise ValueError("payloads must be a list or tuple of snapshots")
@@ -1330,6 +1437,7 @@ class Telemetry:
             states.append(self._restore_validate(data))
         # 第二阶段：在副本上按顺序试合并，冲突检查全部通过后才提交。
         merged = self._merged_state(states)
+        self._check_state_capacity(merged[0], merged[1])
         self.counters, self.samples, self.spans = merged
         return None
 
