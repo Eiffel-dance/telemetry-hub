@@ -1260,6 +1260,89 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def sample_percentile(self, name, q, labels=None, service=None):
+        """离线诊断：一次合并同名且满足筛选的多条样本序列并计算分位数，只读不改状态。
+
+        name 必须可哈希，不可哈希统一抛 ValueError。q 只接受非 bool 的
+        int/float，必须有限且落在 [0, 100] 闭区间，否则统一抛 ValueError。
+        service 省略或显式 None 匹配全部服务；提供时沿用快照筛选语义，只能
+        是字符串，空字符串表示默认服务，其他类型一律 ValueError。labels 省略
+        或显式 None 匹配全部完整标签集合；提供时沿用 observe 的成对输入、键
+        排序、重复键拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配
+        （显式空标签只命中无标签序列）。上述全部参数校验先于任何样本读取
+        完成：不读 clock、不产生部分结果、不改变聚合状态与输入对象。
+
+        命中序列的选取与排序和快照完全一致：先按快照对服务、名称、标签的
+        现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配的序列，
+        并忽略 values 为空的序列。每条序列内部沿用 values 的原有写入顺序
+        拼接，所有历史值先按 observe 的相同规则转换为有限 float：任一值
+        转换失败、超大整数溢出、NaN、无穷或自定义转换异常都统一抛
+        ValueError；全部值先完成转换才计算分位数，绝不返回部分结果。
+
+        没有匹配的非空样本时返回 None。有数据时对上述数值副本升序排列
+        （排序副本不回写任何 values），以位置 (n-1)*q/100 线性插值，位置
+        为整数时直接取该项，q=0/100 分别得到最小值/最大值，返回值始终是
+        Python float。整个过程纯只读：不联网、不调用 clock、不修改聚合器、
+        输入标签或既有 values，不写入 snapshot/json/digest 或恢复载荷，
+        也不新增快照字段；重复调用结果一致，从 restore、merge_snapshot 或
+        batch 得到的样本遵循同一规则。
+        """
+        # 全部入站校验先于样本读取：name 可哈希；q 只接受非 bool 的有限
+        # int/float 且落在 [0, 100]；service 沿用快照筛选语义；labels 省略/
+        # None 匹配全部标签集合，提供时按 observe 规则归一化。
+        self._restore_hashable(name, "name")
+        q = self._check_percentile_q(q)
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 序列选取与排序和 sample_summary/快照完全一致：先按快照对
+        # (service, name, labels) 的稳定顺序排列全部序列，再按名称与筛选
+        # 挑出非空序列：相对顺序与同条件快照中同名条目逐项一致。
+        ordered_keys = [
+            key
+            for key, _ in sorted(
+                self.samples.items(),
+                key=lambda item: _OrderableTuple(item[0]),
+            )
+        ]
+        selected = []
+        for svc, key_name, key_labels in ordered_keys:
+            try:
+                matches = (
+                    key_name == name
+                    and (service is None or svc == service)
+                    and (labels is None or key_labels == labels)
+                )
+            except Exception as exc:
+                # 自定义标识的比较异常同样属于入参非法，统一为 ValueError。
+                raise ValueError(
+                    "invalid sample_percentile selector: %s" % (exc,)
+                )
+            if matches:
+                values = self.samples[(svc, key_name, key_labels)]
+                if values:  # values 为空的序列不参与分位数计算
+                    selected.append(values)
+        # 序列顺序来自快照排序，序列内部沿用 values 写入顺序拼接。全部值先
+        # 按 observe 相同的有限浮点规则转换完才排序插值：任一转换失败统一
+        # ValueError（_finite_float 已把底层各类异常归一），不返回部分结果。
+        numbers = []
+        for values in selected:
+            for value in values:
+                numbers.append(self._finite_float(value))
+        if not numbers:  # 没有匹配的非空样本：无分位数可言
+            return None
+        # 排序只作用于本次新建的数值副本，不回写任何 values。
+        numbers.sort()
+        position = (len(numbers) - 1) * q / 100.0
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:  # 整数位置（含 q=0 与 q=100）：直接取该项
+            return float(numbers[lower])
+        fraction = position - lower
+        return float(
+            numbers[lower] + (numbers[upper] - numbers[lower]) * fraction
+        )
+
     def span_duration_stats(self, service=None, labels=None, status="closed"):
         """离线诊断：对已结束跨度的耗时（end 减 start）做汇总，只读不改状态。
 
