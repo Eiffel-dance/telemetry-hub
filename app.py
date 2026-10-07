@@ -517,6 +517,33 @@ class Telemetry:
         self._restore_hashable(span, "span")
         self._apply_finish(self.spans, service, span, error, self.clock)
 
+    def span(self, span, parent=None, service=None, labels=()):
+        """上下文入口：返回一个作用域对象，用 with 记录一次完整跨度。
+
+        本方法本身只构造作用域对象：不做任何校验、不读取 clock、不改变
+        聚合。进入 with 时按 start 的同一顺序完成 service 归一化、span
+        可哈希与 labels 校验及跨度容量检查，全部通过后只读取一次 clock
+        并创建 open 记录；重复标识、非法输入或容量超限继续分别抛
+        ValueError 或 TelemetryCapacityError，失败不留记录也不读 clock。
+        正常离开 with 时按 finish 的同一实现只结束本作用域创建的跨度：
+        再读取一次 clock 写入 end 并把 error 置为 None。代码块抛出异常
+        时，退出处理先把同一个异常对象写入 error，再完成结束并返回
+        False，原异常继续向外传播；query、trace、snapshot、json 对异常
+        对象的既有展示与 JSON 占位规则不变。结束时 clock 自身抛出的异常
+        原样传播，跨度保留调用结束前的 end 与 error 状态。作用域是一次
+        性的：退出后再次进入或再次退出都抛 ValueError，且不生成第二个
+        时间戳。
+
+        上下文可嵌套、可跨 service 使用；parent 只采用显式传入值，不自
+        动改写父子关系；同一实例内不同 service 的同名跨度继续隔离。空代
+        码块同样生成闭合跨度。作用域上可读取 span、service、parent、
+        start、end、error 状态，每次读取都返回与聚合器隔离的值，修改读
+        取结果不会回写聚合器。经本入口产生的跨度与 start/finish 产生的
+        记录在 query、trace、耗时查询、batch 后续事件、restore 与 merge
+        中完全一致；snapshot、json、digest、diff_snapshots 的字段不变。
+        """
+        return _SpanScope(self, span, parent, service, labels)
+
     # ------------------------------------------------------------------
     # 离线批量回放
     # ------------------------------------------------------------------
@@ -2835,3 +2862,119 @@ class Telemetry:
                 "labels": labels,
             }
         return spans
+
+
+class _SpanScope:
+    """Telemetry.span() 返回的一次性上下文管理器。
+
+    构造时只保存入参，不校验、不读 clock、不触碰聚合；进入 with 时按
+    start 的同一顺序完成校验并创建 open 记录，离开 with 时按 finish 的
+    同一实现结束该记录。span/service/parent/start/end/error 属性每次
+    读取都经 _isolate_mutable 返回与聚合器隔离的值，调用方修改读取
+    结果不会回写聚合器。
+    """
+
+    __slots__ = (
+        "_telemetry",
+        "_span",
+        "_parent",
+        "_service",
+        "_labels",
+        "_record",
+        "_entered",
+        "_exited",
+    )
+
+    def __init__(self, telemetry, span, parent, service, labels):
+        self._telemetry = telemetry
+        self._span = span
+        self._parent = parent
+        self._service = service
+        self._labels = labels
+        # 进入成功后指向聚合器内的实时记录，属性读取据此反映当前状态；
+        # 未进入（或进入失败）时为 None，start/end/error 读取为 None。
+        self._record = None
+        self._entered = False
+        self._exited = False
+
+    def __enter__(self):
+        # 一次性语义：成功进入过的作用域不能再次进入，拒绝时不读 clock、
+        # 不改变聚合。进入失败（校验或容量拒绝）不标记为已进入，作用域
+        # 对象本身不留下任何聚合痕迹。
+        if self._entered:
+            raise ValueError("span scope cannot be re-entered")
+        telemetry = self._telemetry
+        # 与 start 完全相同的入站校验与写入顺序：service 归一化、span
+        # 可哈希、labels 归一化、新跨度容量检查，全部通过后由
+        # _apply_start 读取一次 clock 并创建 open 记录；任一拒绝都发生
+        # 在状态写入与 clock 读取之前。
+        service = telemetry._service(self._service)
+        telemetry._restore_hashable(self._span, "span")
+        labels = telemetry._normalize_labels(self._labels)
+        if (service, self._span) not in telemetry.spans:
+            telemetry._check_span_capacity_for_new_key(telemetry.spans)
+        telemetry._apply_start(
+            telemetry.spans, service, self._span, self._parent, labels,
+            telemetry.clock,
+        )
+        self._service = service
+        self._labels = labels
+        self._record = telemetry.spans[(service, self._span)]
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # 退出后再次退出（或从未成功进入）一律 ValueError，且不生成第二
+        # 个时间戳；标记先于结束写入，clock 抛异常时重试同样被拒绝。
+        if not self._entered or self._exited:
+            raise ValueError("span scope is already exited")
+        self._exited = True
+        record = self._record
+        if exc is not None:
+            # 代码块抛出异常：先把同一个异常对象写入 error，再完成结束。
+            # 随后 _apply_finish 若因 clock 抛异常而中断，记录保留此处
+            # 写入的 error 与调用结束前的 end（仍为空）。
+            record["error"] = exc
+        # 与 finish 相同的唯一结束实现：不存在或已结束的校验先于时间戳
+        # 读取，clock 每次结束只被调用一次；clock 抛出的异常原样传播。
+        # 正常离开时 record["error"] 仍为 None，结束后 error 即为 None。
+        Telemetry._apply_finish(
+            self._telemetry.spans, self._service, self._span,
+            record["error"], self._telemetry.clock,
+        )
+        # 返回 False：代码块中的异常（若有）继续向外传播，绝不吞没。
+        return False
+
+    @property
+    def span(self):
+        return _isolate_mutable(self._span)
+
+    @property
+    def service(self):
+        # 进入成功后为归一化服务名（缺省为空字符串）；未进入时保留入参。
+        return self._service
+
+    @property
+    def parent(self):
+        return _isolate_mutable(self._parent)
+
+    @property
+    def start(self):
+        record = self._record
+        if record is None:
+            return None
+        return _isolate_mutable(record["start"])
+
+    @property
+    def end(self):
+        record = self._record
+        if record is None:
+            return None
+        return _isolate_mutable(record["end"])
+
+    @property
+    def error(self):
+        record = self._record
+        if record is None:
+            return None
+        return _isolate_mutable(record["error"])

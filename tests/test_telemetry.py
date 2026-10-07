@@ -5051,5 +5051,219 @@ class TelemetrySpansByStartTimeTest(unittest.TestCase):
         )
 
 
+class TelemetrySpanContextTest(unittest.TestCase):
+    def test_empty_block_closes_span_with_two_clock_reads(self):
+        ticks = iter(range(10, 100, 10))
+        calls = []
+        def clock():
+            value = next(ticks)
+            calls.append(value)
+            return value
+        t = Telemetry(clock)
+        with t.span("r") as scope:
+            # 进入后只读了一次 clock，记录处于 open 状态
+            self.assertEqual(calls, [10])
+            self.assertEqual(t.query("open")[0]["span"], "r")
+            self.assertIsNone(scope.end)
+        self.assertEqual(calls, [10, 20])  # 进出各读一次
+        entry = t.query("closed")[0]
+        self.assertEqual(
+            set(entry), {"span", "service", "parent", "start", "end", "error"}
+        )
+        self.assertEqual((entry["start"], entry["end"]), (10, 20))
+        self.assertIsNone(entry["error"])
+        self.assertEqual(t.query("open"), [])
+
+    def test_scope_attributes_and_isolation(self):
+        t = Telemetry(iter(range(100)).__next__)
+        parent = ["p"]
+        with t.span("s", parent=parent, service="api",
+                    labels=(("k", "v"),)) as scope:
+            self.assertEqual(scope.span, "s")
+            self.assertEqual(scope.service, "api")
+            self.assertEqual(scope.parent, ["p"])
+            self.assertEqual(scope.start, 0)
+            self.assertIsNone(scope.end)
+            self.assertIsNone(scope.error)
+            # 修改读取结果不回写聚合器
+            scope.parent.append("x")
+            self.assertEqual(scope.parent, ["p"])
+            self.assertEqual(t.query("open")[0]["parent"], ["p"])
+        self.assertEqual(scope.end, 1)
+        self.assertIsNone(scope.error)
+        # 退出后属性仍只读反映最终状态，且与聚合器隔离
+        self.assertEqual(t.trace("s", service="api")["parent"], ["p"])
+
+    def test_exception_records_error_and_propagates(self):
+        t = Telemetry(iter(range(100)).__next__)
+        boom = RuntimeError("boom")
+        with self.assertRaises(RuntimeError) as caught:
+            with t.span("r", service="api") as scope:
+                raise boom
+        self.assertIs(caught.exception, boom)  # 原异常继续传播
+        entry = t.query("error")[0]
+        self.assertIs(entry["error"], boom)  # 同一个异常对象
+        self.assertEqual(entry["end"], 1)
+        self.assertEqual(t.query("open"), [])
+        # json 对不可严格表示的异常沿用既有占位规则
+        payload = json.loads(t.json())
+        self.assertEqual(
+            payload["spans"][0]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        self.assertEqual(scope.error, boom)
+
+    def test_enter_validation_failures_leave_no_record_no_clock(self):
+        def clock():
+            raise AssertionError("clock must not be read")
+        t = Telemetry(clock)
+        for make in (
+            lambda: t.span("x", service=""),
+            lambda: t.span("x", service=1),
+            lambda: t.span(["unhashable"]),
+            lambda: t.span("x", labels=(("k", 1), ("k", 2))),
+            lambda: t.span("x", labels=(("k", float("nan")),)),
+        ):
+            with self.assertRaises(ValueError):
+                with make():
+                    pass
+        self.assertEqual(t.snapshot()["spans"], [])
+        # 重复标识沿用 ValueError，同样不留记录、不读 clock
+        t3 = Telemetry()
+        t3.start("dup")
+        t3.clock = clock
+        with self.assertRaises(ValueError):
+            with t3.span("dup"):
+                pass
+
+    def test_capacity_error_on_enter(self):
+        t = Telemetry(max_spans=1)
+        with t.span("a"):
+            pass
+        before = t.snapshot()
+        with self.assertRaises(TelemetryCapacityError):
+            with t.span("b"):
+                pass
+        self.assertEqual(t.snapshot(), before)  # 拒绝不改变聚合
+        # 容量不超限时正常记录
+        t2 = Telemetry(iter(range(10)).__next__, max_spans=1)
+        with t2.span("only"):
+            pass
+        self.assertEqual(len(t2.query("closed")), 1)
+
+    def test_reuse_and_refinish_rejected_without_second_timestamp(self):
+        ticks = iter(range(100))
+        t = Telemetry(lambda: next(ticks))
+        scope = t.span("r")
+        with scope:
+            pass
+        with self.assertRaises(ValueError):
+            with scope:  # 重复使用
+                pass
+        with self.assertRaises(ValueError):
+            scope.__exit__(None, None, None)  # 再次退出
+        with self.assertRaises(ValueError):
+            t.finish("r")  # 上下文退出后再次结束
+        self.assertEqual(t.query("closed")[0]["end"], 1)
+        self.assertEqual(len(t.snapshot()["spans"]), 1)
+
+    def test_clock_failure_on_finish_keeps_pre_finish_state(self):
+        calls = []
+
+        def clock():
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("clock broke")
+            return 0
+
+        t = Telemetry(clock)
+        with self.assertRaises(RuntimeError):
+            with t.span("r"):
+                pass
+        entry = t.query("open")[0]  # end 未写入，仍是 open
+        self.assertEqual(entry["start"], 0)
+        self.assertIsNone(entry["end"])
+        self.assertIsNone(entry["error"])
+
+        # 异常路径：error 已先写入，clock 失败时 end 仍为空、error 保留
+        calls.clear()
+        t2 = Telemetry(clock)
+        boom = KeyError("k")
+        with self.assertRaises(RuntimeError):
+            with t2.span("r"):
+                raise boom
+        entry = t2.query("open")[0]
+        self.assertIsNone(entry["end"])
+        self.assertIs(entry["error"], boom)
+
+    def test_nesting_cross_service_and_explicit_parent(self):
+        t = Telemetry(iter(range(100)).__next__)
+        with t.span("outer", service="a"):
+            with t.span("inner", parent="outer", service="a"):
+                pass
+            with t.span("outer", service="b"):  # 跨 service 同名隔离
+                pass
+        a_closed = t.query("closed", service="a")
+        # 快照稳定顺序按服务、开始时间、标识：outer 先于 inner 开始
+        self.assertEqual([e["span"] for e in a_closed], ["outer", "inner"])
+        tree = t.trace("outer", service="a")
+        self.assertEqual([c["span"] for c in tree["children"]], ["inner"])
+        # parent 只采用显式传入值：未传 parent 的嵌套跨度不自动挂父子
+        self.assertIsNone(t.trace("outer", service="b")["parent"])
+        self.assertEqual(
+            [e["span"] for e in t.query("closed", service="b")], ["outer"]
+        )
+
+    def test_equivalence_with_start_finish_and_offline_entries(self):
+        # 父子引用须同服务可解析（restore 的严格检查），两个跨度同放 api
+        manual = Telemetry(iter(range(100)).__next__)
+        manual.start("s1", service="api")
+        manual.start("s2", parent="s1", service="api")
+        manual.finish("s2", service="api")
+        manual.finish("s1", service="api")
+
+        scoped = Telemetry(iter(range(100)).__next__)
+        with scoped.span("s1", service="api"):
+            with scoped.span("s2", parent="s1", service="api"):
+                pass
+        self.assertEqual(scoped.snapshot(), manual.snapshot())
+        self.assertEqual(scoped.json(), manual.json())
+        self.assertEqual(scoped.digest(), manual.digest())
+
+        # batch 后续事件可继续作用于 with 创建的跨度
+        t = Telemetry(iter(range(100)).__next__)
+        with t.span("b"):
+            pass
+        t.batch([{"op": "start", "span": "c"}, {"op": "finish", "span": "c"}])
+        self.assertEqual(len(t.query("closed")), 2)
+
+        # restore / merge 结果与手动记录完全一致
+        restored = Telemetry.restore(scoped.json())
+        self.assertEqual(restored.snapshot(), manual.snapshot())
+        merged = Telemetry()
+        merged.merge_snapshot(scoped.snapshot())
+        self.assertEqual(merged.snapshot(), manual.snapshot())
+        diff = Telemetry.diff_snapshots(manual.snapshot(), scoped.snapshot())
+        for section in ("counters", "samples", "spans"):
+            self.assertEqual(diff[section]["added"], [])
+            self.assertEqual(diff[section]["removed"], [])
+            self.assertEqual(diff[section]["changed"], [])
+
+    def test_duration_queries_and_snapshot_shape_unchanged(self):
+        t = Telemetry(iter(range(0, 100, 5)).__next__)
+        with t.span("d", labels=(("k", "v"),)):
+            pass
+        stats = t.span_duration_stats()
+        self.assertEqual(stats["count"], 1)
+        self.assertEqual(stats["values"], [5.0])
+        entry = t.snapshot()["spans"][0]
+        # 快照字段形状与 start/finish 记录一致（有标签时附加 labels）
+        self.assertEqual(
+            set(entry),
+            {"span", "service", "parent", "start", "end", "error", "labels"},
+        )
+        self.assertEqual(entry["labels"], [("k", "v")])
+
+
 if __name__ == "__main__":
     unittest.main()
