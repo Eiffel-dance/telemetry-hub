@@ -2,6 +2,8 @@ import copy
 import json
 import math
 import unittest
+from decimal import Decimal
+from fractions import Fraction
 
 import app as appmod
 from app import SnapshotFormatError, Telemetry, TelemetryCapacityError
@@ -3384,6 +3386,321 @@ class TelemetryCapacityTest(unittest.TestCase):
         with self.assertRaises(TelemetryCapacityError):
             t.inc("overflow")
         self.assertEqual(t.digest(), snap_digest)
+
+
+class TelemetryCounterSummaryTest(unittest.TestCase):
+    def _build(self):
+        t = Telemetry()
+        # 默认服务、无标签序列：1 + 2 = 3
+        t.inc("hits")
+        t.inc("hits", 2)
+        # 默认服务、带标签序列：4
+        t.inc("hits", 4, labels=(("k", "v"),))
+        # api 服务、无标签序列：8 + 16 = 24
+        t.inc("hits", 8, service="api")
+        t.inc("hits", 16, service="api")
+        # 其他名称不应混入
+        t.inc("other", 100)
+        t.inc("other", 200, service="api")
+        return t
+
+    def test_sums_all_same_name_series_in_snapshot_order(self):
+        t = self._build()
+        summary = t.counter_summary("hits")
+        # 期望值按快照稳定顺序（服务、名称、标签）逐序列取 value 原生相加
+        ordered_values = [
+            record["value"]
+            for record in t.snapshot()["counters"]
+            if record["name"] == "hits"
+        ]
+        self.assertEqual(ordered_values, [3, 4, 24])
+        total = 0
+        for value in ordered_values:
+            total = total + value
+        self.assertEqual(
+            summary,
+            {"series_count": 3, "value": total},
+        )
+        self.assertEqual(summary, {"series_count": 3, "value": 31})
+        self.assertIsInstance(summary["series_count"], int)
+        self.assertIsInstance(summary["value"], int)
+        self.assertEqual(set(summary), {"series_count", "value"})
+
+    def test_selection_order_is_snapshot_order_not_insertion_order(self):
+        # 逆快照顺序写入，选择顺序仍必须按服务、名称、标签排列
+        t = Telemetry()
+        t.inc("hits", 24, service="api")
+        t.inc("hits", 4, labels=(("k", "v"),))
+        t.inc("hits", 3)
+        # 浮点逐位验证：另构造一组跨服务浮点计数器，顺序必须与快照一致
+        f = Telemetry()
+        f.inc("rate", 0.1, service="b")
+        f.inc("rate", 0.2, service="b", labels=(("k", "v"),))
+        f.inc("rate", 0.3)  # 默认服务排在 b 之前
+        ordered = [
+            record["value"]
+            for record in f.snapshot()["counters"]
+            if record["name"] == "rate"
+        ]
+        self.assertEqual(ordered, [0.3, 0.1, 0.2])
+        expected = 0
+        for value in ordered:
+            expected = expected + value
+        summary = f.counter_summary("rate")
+        self.assertEqual(summary["series_count"], 3)
+        self.assertEqual(summary["value"].hex(), expected.hex())
+        self.assertEqual(t.counter_summary("hits")["value"], 31)
+
+    def test_service_filter_none_empty_and_named(self):
+        t = self._build()
+        all_summary = t.counter_summary("hits", service=None)
+        self.assertEqual(all_summary["series_count"], 3)
+        self.assertEqual(all_summary["value"], 31)
+        # 省略 service 与显式 None 等价
+        self.assertEqual(t.counter_summary("hits"), all_summary)
+        # 空字符串精确匹配默认服务：无标签与带标签两个序列
+        default_summary = t.counter_summary("hits", service="")
+        self.assertEqual(default_summary, {"series_count": 2, "value": 7})
+        # 具名服务精确匹配
+        self.assertEqual(
+            t.counter_summary("hits", service="api"),
+            {"series_count": 1, "value": 24},
+        )
+        self.assertIsNone(t.counter_summary("hits", service="web"))
+        for bad in (1, 1.5, b"api", ["api"], object()):
+            with self.assertRaises(ValueError):
+                t.counter_summary("hits", service=bad)
+
+    def test_labels_filter_none_empty_and_specific(self):
+        t = self._build()
+        # None 匹配全部标签集合
+        self.assertEqual(t.counter_summary("hits", labels=None)["value"], 31)
+        # 显式空标签只匹配无标签计数器：默认服务与 api 各一条
+        self.assertEqual(
+            t.counter_summary("hits", labels=()),
+            {"series_count": 2, "value": 27},
+        )
+        # 具名标签按归一化后的完整集合精确匹配
+        self.assertEqual(
+            t.counter_summary("hits", labels=(("k", "v"),)),
+            {"series_count": 1, "value": 4},
+        )
+        # 标签输入顺序不影响匹配
+        t.inc("hits2", 3, labels=(("a", 1), ("b", 2)))
+        self.assertEqual(
+            t.counter_summary("hits2", labels=(("b", 2), ("a", 1))),
+            {"series_count": 1, "value": 3},
+        )
+        # 数组/对象标签值按规范化后的完整 JSON 结构精确匹配
+        t.inc("hits3", 9, labels=(("k", ["a", "b"]),))
+        self.assertEqual(
+            t.counter_summary("hits3", labels=(("k", ["a", "b"]),))["value"],
+            9,
+        )
+        # 没有该标签集合时返回 None
+        self.assertIsNone(t.counter_summary("hits", labels=(("k", "x"),)))
+        # 重复键、不可严格 JSON 序列化的值统一 ValueError
+        with self.assertRaises(ValueError):
+            t.counter_summary("hits", labels=(("k", 1), ("k", 2)))
+        with self.assertRaises(ValueError):
+            t.counter_summary("hits", labels=(("k", float("nan")),))
+        with self.assertRaises(ValueError):
+            t.counter_summary("hits", labels=(("k", object()),))
+
+    def test_service_and_labels_filter_combined(self):
+        t = self._build()
+        self.assertEqual(
+            t.counter_summary("hits", labels=(), service="api"),
+            {"series_count": 1, "value": 24},
+        )
+        self.assertIsNone(
+            t.counter_summary("hits", labels=(("k", "v"),), service="api")
+        )
+        self.assertIsNone(t.counter_summary("hits", labels=(), service="web"))
+
+    def test_only_exact_name_matches(self):
+        t = self._build()
+        self.assertIsNone(t.counter_summary("hit"))
+        self.assertIsNone(t.counter_summary("hitsx"))
+        self.assertEqual(t.counter_summary("other")["value"], 300)
+
+    def test_missing_name_and_empty_aggregator_return_none(self):
+        t = self._build()
+        self.assertIsNone(t.counter_summary("nope"))
+        # 空聚合器
+        self.assertIsNone(Telemetry().counter_summary("hits"))
+        # 服务/标签筛选后无同名序列同样返回 None
+        self.assertIsNone(t.counter_summary("other", service="web"))
+
+    def test_unhashable_name_rejected_before_reading_counters(self):
+        t = self._build()
+        with self.assertRaises(ValueError):
+            t.counter_summary(["hits"])
+        with self.assertRaises(ValueError):
+            t.counter_summary({"a": 1})
+        with self.assertRaises(ValueError):
+            t.counter_summary({"a"})
+
+    def test_native_addition_types_preserved_without_float_coercion(self):
+        # 纯整数：自整数 0 相加，结果仍是 int
+        t = Telemetry()
+        t.inc("n", 1)
+        t.inc("n", 2)
+        result = t.counter_summary("n")
+        self.assertEqual(result, {"series_count": 1, "value": 3})
+        self.assertIs(type(result["value"]), int)
+
+        # int 与 float 以 Python 加法语义相遇后才成为 float，不做隐式整体转换
+        mixed = Telemetry()
+        mixed.inc("n", 5, service="a")
+        mixed.inc("n", 2.5, service="b")
+        result = mixed.counter_summary("n")
+        self.assertEqual(result["value"], 7.5)
+        self.assertIs(type(result["value"]), float)
+
+        # Decimal 与 Fraction 的原生类型在各自同类型序列中保留
+        dec = Telemetry()
+        dec.inc("d", Decimal("0.1"))
+        dec.inc("d", Decimal("0.2"))
+        result = dec.counter_summary("d")
+        self.assertIsInstance(result["value"], Decimal)
+        self.assertEqual(result["value"], Decimal("0.3"))
+
+        frac = Telemetry()
+        frac.inc("f", Fraction(1, 3))
+        frac.inc("f", Fraction(1, 6))
+        result = frac.counter_summary("f")
+        self.assertIsInstance(result["value"], Fraction)
+        self.assertEqual(result["value"], Fraction(1, 2))
+
+        # bool 按 int 加法语义参与：0 + True 得到 int 1，而非 1.0 或 True
+        booleans = Telemetry()
+        booleans.counters[("", "b", ())] = True
+        result = booleans.counter_summary("b")
+        self.assertEqual(result["value"], 1)
+        self.assertIs(type(result["value"]), int)
+        self.assertIsNot(type(result["value"]), bool)
+
+    def test_addition_failure_raises_value_error_without_partial_result(self):
+        # 与整数 0 无法相加的值（字符串）：统一 ValueError
+        t = Telemetry()
+        t.inc("n", 1, service="a")
+        t.counters[("b", "n", ())] = "oops"
+        with self.assertRaises(ValueError):
+            t.counter_summary("n")
+
+        # 自定义 __radd__ 抛任意异常同样归一为 ValueError
+        class ExplodingValue:
+            __slots__ = ()
+
+            def __radd__(self, other):
+                raise RuntimeError("boom")
+
+        t.counters[("b", "n", ())] = ExplodingValue()
+        with self.assertRaises(ValueError):
+            t.counter_summary("n")
+
+        # 首个序列就抛异常（0 + value 走 __add__）也归一为 ValueError
+        class ExplodingFirst:
+            def __add__(self, other):
+                raise RuntimeError("bang")
+
+        first = Telemetry()
+        first.counters[("", "n", ())] = ExplodingFirst()
+        with self.assertRaises(ValueError):
+            first.counter_summary("n")
+
+    def test_invalid_arguments_rejected_before_reading_counters(self):
+        t = Telemetry()
+        t.inc("n", 1)
+        t.counters[("b", "n", ())] = "bad"  # 历史值本会导致相加失败
+        # 坏 service 与坏数据并存时先抛参数 ValueError，不进入相加
+        with self.assertRaises(ValueError):
+            t.counter_summary("n", service=123)
+        # 坏 labels 同样先于计数器读取
+        with self.assertRaises(ValueError):
+            t.counter_summary("n", labels=(("k", 1), ("k", 2)))
+        with self.assertRaises(ValueError):
+            t.counter_summary(["n"], service="api")
+
+    def test_does_not_read_clock_or_mutate_state(self):
+        class BoomClock:
+            def __call__(self):
+                raise AssertionError("clock must not be called")
+
+        t = Telemetry(BoomClock())
+        t.inc("hits", 3)
+        t.inc("hits", 4, service="api")
+        before = t.snapshot()
+        before_digest = t.digest()
+        summary = t.counter_summary("hits")
+        self.assertEqual(summary, {"series_count": 2, "value": 7})
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.digest(), before_digest)
+        # 输入标签不被修改
+        labels = [("b", 2), ("a", 1)]
+        t.inc("tagged", 5, labels=labels)
+        t.counter_summary("tagged", labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+
+    def test_result_is_independent_and_repeatable(self):
+        t = self._build()
+        first = t.counter_summary("hits")
+        second = t.counter_summary("hits")
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        first["value"] = 999
+        first["extra"] = "x"
+        third = t.counter_summary("hits")
+        self.assertEqual(third["value"], 31)
+        self.assertNotIn("extra", third)
+
+    def test_works_after_restore_merge_and_batch(self):
+        t = self._build()
+        restored = Telemetry.restore(t.json())
+        self.assertEqual(
+            restored.counter_summary("hits"), t.counter_summary("hits")
+        )
+        # 合并进来的计数器同样可查询，相同键按加法语义累加
+        merged = Telemetry()
+        merged.inc("hits", 100)
+        merged.merge_snapshot(t.snapshot(service=""))
+        self.assertEqual(
+            merged.counter_summary("hits"),
+            {"series_count": 2, "value": 107},
+        )
+        # batch 回放产生的计数器可查询
+        batched = Telemetry()
+        batched.batch([
+            {"op": "inc", "name": "x", "value": 5},
+            {"op": "inc", "name": "x", "value": 7, "service": "s"},
+        ])
+        self.assertEqual(
+            batched.counter_summary("x"),
+            {"series_count": 2, "value": 12},
+        )
+        # from_snapshot 路径同样可查询
+        rebuilt = Telemetry.from_snapshot(t.snapshot())
+        self.assertEqual(
+            rebuilt.counter_summary("hits"), t.counter_summary("hits")
+        )
+
+    def test_does_not_add_snapshot_fields_or_change_digest(self):
+        t = self._build()
+        t.counter_summary("hits")
+        t.counter_summary("hits", service="api", labels=())
+        for record in t.snapshot()["counters"]:
+            self.assertEqual(
+                set(record), {"service", "name", "labels", "value"}
+            )
+        payload = json.loads(t.json())
+        for record in payload["counters"]:
+            self.assertEqual(
+                set(record), {"service", "name", "labels", "value"}
+            )
+        # 摘要结果不出现在任何快照/diff 字段中
+        diff = Telemetry.diff_snapshots(Telemetry().snapshot(), t.snapshot())
+        self.assertEqual(set(diff), {"counters", "samples", "spans"})
 
 
 class TelemetrySampleSummaryTest(unittest.TestCase):

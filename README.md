@@ -21,6 +21,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，有标签的节点附加可安全修改的 `labels` 字段，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
 - `percentile(name, q, labels=(), service=None)`：只读的分位数查询，用于离线诊断样本分布，调用方不需要先导出或修改聚合器状态。`service` 与 `labels` 的归一化规则与 `observe` 完全一致（`service` 缺省归一化为空字符串，显式传入必须是非空字符串；标签按键字典序归一化，重复键或不可 JSON 序列化抛 `ValueError`），`name` 必须可哈希才能作为样本键，不可哈希抛 `ValueError`。`q` 只接受非 `bool` 的 `int`/`float`，必须为有限值且落在 `[0, 100]` 闭区间，否则统一抛 `ValueError`；任何拒绝都发生在读取样本之前——不读 clock、不改变计数器、样本、跨度或输入对象，也不产生部分结果。样本键不存在或序列为空返回 `None`；命中时按公开浮点规则把每个值转换为数值并升序排序（排序副本不回写 `values`），以位置 `(n-1)*q/100` 线性插值，位置为整数时直接取该项，`q=0`/`q=100` 分别得到最小值/最大值，返回 Python `float`。该入口只读取当前聚合，重复调用结果相同，也不新增 `snapshot()`/`json()` 字段。
 - `histogram(name, boundaries, labels=(), service=None)`：只读的数值分布计数，用于离线诊断，调用方不需要先导出或修改聚合器状态。`service`、`labels` 与 `name` 的定位、默认服务、标签规范化与精确匹配规则与 `observe`/`percentile` 完全一致，非法值统一抛 `ValueError`。`boundaries` 必须是非空 `list` 或 `tuple`，元素必须是非 `bool` 的 `int`/`float`、有限且严格递增，任一不合法统一抛 `ValueError`，且全部边界校验在读取样本之前完成（不读 clock、不产生部分结果）。样本键不存在或序列为空返回 `None`；命中时每个样本先按 `observe` 的规则转成有限 `float`（已有数据无法转换时同样抛 `ValueError`，不返回部分结果），再按左开右闭分桶：第一桶统计小于等于 `boundaries[0]`，中间桶统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。返回全新字典，只含 `boundaries`（与输入顺序一致的独立列表）、`counts`（长度为 `len(boundaries)+1` 的整数列表）与 `count`（各桶计数之和）。每次调用都重新构造结果，修改返回值不影响内部状态，不读 clock、不改变样本顺序、也不触发序列化；该入口不改变 `percentile`/`snapshot()`/`json()` 的字段与结果。
+- `counter_summary(name, labels=None, service=None)`：只读的同名计数器汇总查询，用于离线诊断时一次查看同名计数器跨多个序列（服务、完整标签集合不同）的累加结果，调用方不需要先导出快照再自行拼接，全程不联网。`name` 必须可哈希，不可哈希统一抛 `ValueError`。`service` 省略或显式 `None` 匹配所有服务；提供时与快照筛选一致，只能是字符串，空字符串表示默认服务，数字、字节串、列表等其他类型统一抛 `ValueError`。`labels` 省略或显式 `None` 匹配所有完整标签集合；提供时沿用 `inc`/`observe` 的成对标签规则：按键排序、拒绝重复键和不能严格 JSON 表示的值，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签序列）。任何非法参数都在读取计数器之前统一抛 `ValueError`：不读 clock、不产生部分结果、不修改聚合状态与输入标签。查询只选取名称完全相等且满足筛选的计数器，选择顺序沿用快照对服务、名称、标签的稳定排序，只由该排序决定，不受字典插入顺序影响。对选中的每个序列取当前 `value`，自数字 `0` 起按上述顺序逐个使用既有计数器的加法语义（Python 原生 `+`）累加——不把 `value` 隐式转成浮点，保留 Python 加法所得的原生类型（如 `int`、`float`、`Decimal`）；任意值无法参与加法或加法过程抛出异常时统一抛 `ValueError`，且在全部值处理完成前不返回部分结果。成功时返回全新字典，只含 `series_count` 和 `value`：`series_count` 是选中序列数（Python `int`），`value` 是确定顺序累加后的结果；没有匹配序列返回 `None`。返回字典及其中可变值与内部状态互不共享，重复调用结果相同；该查询纯只读，不读取 clock、不联网、不修改聚合、容量、输入标签或任何快照，不向 `snapshot`/`json`/`digest`/`diff_snapshots` 增加字段，恢复、合并与 `batch` 产生的计数器同样可查询，`inc`、`observe`、`start`、`finish`、`query`、`trace` 及既有异常和排序行为保持不变。
 - `sample_summary(name, labels=None, service=None)`：只读的同名样本序列汇总，用于离线诊断时一次合并同名序列，调用方不需要先导出快照再自行合并，全程不联网。`name` 必须可哈希，不可哈希统一抛 `ValueError`。`service` 省略或显式 `None` 匹配所有服务；提供时只能是字符串，按快照筛选语义精确匹配，空字符串表示默认服务，其他类型统一抛 `ValueError`。`labels` 省略或显式 `None` 匹配所有完整标签集合；提供时沿用 `observe` 的成对输入、键排序、重复键拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空序列只匹配无标签样本）。全部参数校验先于任何样本读取：不读 clock、不产生部分结果、不修改聚合状态与输入标签。序列选取与排序与快照完全一致：先按快照对服务、名称、标签的现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配且 `values` 非空的序列（空 `values` 序列不参与汇总）；每条序列内部沿用 `values` 的写入顺序，把所有值按公开有限浮点规则转换后合并——任一历史值无法转换为有限数值（含超大整数溢出、自定义 `__float__` 异常、NaN/无穷）或转换过程出现异常，统一抛 `ValueError`，且全部值先完成转换才形成结果，绝不返回部分字典。成功返回全新字典，只含 `series_count`、`count`、`sum`、`minimum`、`maximum`、`mean`：`series_count` 是参与汇总的非空序列数，`count` 是实际值总数，`sum` 自 `0.0` 起按上述确定顺序累加，`minimum`/`maximum` 为全体数值的最小/最大值，`mean` 等于 `sum` 除以 `count`；两个计数字段为 Python `int`，其余统计字段为 Python `float`。没有匹配序列或没有可保留值时返回 `None`。返回结果可安全修改，重复调用结果一致；该查询不写入 `snapshot`/`json`/`digest` 或恢复载荷，也不新增快照字段，现有容量限制、跨度生命周期、异常保存及恢复、合并与批量回放行为保持原状。
 - `histogram_summary(name, boundaries, labels=None, service=None)`：只读的同名样本序列合并分桶查询，用于离线诊断时把同名且满足筛选的多条样本序列合并为一次分桶计数，调用方不需要先导出快照再自行拼接，全程不联网。`name` 必须可哈希，不可哈希统一抛 `ValueError`。`service` 省略或显式 `None` 匹配所有服务；提供时沿用快照筛选语义，只能是字符串，空字符串表示默认服务，其他类型统一抛 `ValueError`。`labels` 省略或显式 `None` 匹配所有完整标签集合；提供时沿用 `observe` 的成对输入、键排序、重复键拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签序列）。`boundaries` 必须是非空 `list`/`tuple`，元素必须是非 `bool` 的 `int`/`float`、有限且严格递增，任一不合法统一抛 `ValueError`。上述全部参数校验先于任何样本读取完成：不读 clock、不产生部分结果、不改变聚合状态与输入对象。命中序列的选取与排序与快照完全一致：先按快照对服务、名称、标签的现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配的序列并过滤掉 `values` 为空的序列；每条序列内部沿用 `values` 的写入顺序拼接，所有值先按 `observe` 相同规则转换为有限 `float`——任一历史值转换失败、溢出、NaN、无穷或自定义转换异常都统一抛 `ValueError`，且全部值先完成转换才分桶，绝不返回部分结果。随后使用左开右闭分桶：第一桶统计小于等于 `boundaries[0]`，中间桶统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。成功返回全新字典，只含 `boundaries`（与输入顺序一致的独立列表）、`counts`（长度为 `len(boundaries)+1` 的整数列表）与 `count`（各桶计数之和）；没有可参与的非空序列时返回 `None`。返回结果可安全修改，重复调用结果一致；恢复或合并得到的样本同样可查询；该查询不写入 `snapshot`/`json`/`digest` 或恢复载荷，也不新增快照字段，现有容量、跨度生命周期、恢复、合并、批量回放及既有 `histogram` 行为保持原状。
 - `span_duration_stats(service=None, labels=None, status="closed")`：只读的跨度耗时汇总，用于离线诊断直接读取已记录跨度的耗时，调用方不需要先导出快照，全程不联网。只统计已经结束的跨度：`status` 只接受 `'closed'` 与 `'error'`，`'closed'` 包含所有 `end` 已写入的跨度（成功结束与带异常结束都算），`'error'` 只包含其中 `error` 不为 `None` 的跨度（`0`、`False`、空容器等假值也不例外）；传入 `'open'` 或任何其他值（含 `None` 与非字符串）统一抛 `ValueError`。`service` 与 `labels` 的筛选语义与 `query` 完全一致：`service` 缺省（`None`）匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。服务、标签或状态校验失败都在读取任何跨度之前抛 `ValueError`——不读 clock、不产生部分结果、不改变聚合状态。筛选后没有已结束跨度时返回 `None`；命中时返回全新字典，含 `values`、`count`、`sum`、`minimum`、`maximum`、`mean`：`values` 按 `query`/`snapshot` 对跨度使用的稳定顺序（服务、开始时间、标识）排列，每个元素是对应跨度 `end` 与 `start` 各自按现有样本统计的有限浮点规则转换后相减得到的 Python `float`，任一结束跨度的时间戳无法转换为有限数值（含超大整数溢出、自定义 `__float__` 异常、NaN/无穷）统一抛 `ValueError` 且不返回部分结果（未结束跨度不参与统计，其时间戳不会被转换）；`count` 等于 `values` 长度，`sum` 自 `0.0` 起按 `values` 顺序累加，`minimum`/`maximum` 为这批耗时的最小/最大值，`mean` 等于 `sum` 除以 `count`。每次调用都重新构造结果字典与 `values` 列表，可安全修改，不与内部状态共享；该入口纯只读，不读 clock、不改变样本与跨度顺序，也不向 `snapshot()`/`json()` 新增字段，未结束跨度仍可通过原入口查询，异常对象的保存与 JSON 占位规则不变。
@@ -69,6 +70,30 @@ t.histogram("missing", [1, 2])            # None：样本键不存在
 t.histogram("x", [])                      # ValueError：boundaries 必须非空
 t.histogram("x", [5, 1])                  # ValueError：必须严格递增
 t.histogram("x", [1, True])               # ValueError：bool 不是合法边界
+```
+
+## counter_summary 示例
+
+```python
+t = Telemetry()
+t.inc("hits"); t.inc("hits", 2)                        # 默认服务、无标签：3
+t.inc("hits", 4, labels=(("k", "v"),))                # 默认服务、带标签：4
+t.inc("hits", 8, service="api"); t.inc("hits", 16, service="api")  # 24
+
+t.counter_summary("hits")
+# {'series_count': 3, 'value': 31}
+# 序列按快照顺序（服务、名称、标签）逐个取 value，自 0 原生相加，不转 float
+
+t.counter_summary("hits", service="")        # 只汇总默认服务（含带标签序列）
+# {'series_count': 2, 'value': 7}
+t.counter_summary("hits", labels=(), service="api")
+# {'series_count': 1, 'value': 24}：显式空标签只命中无标签序列
+t.counter_summary("hits", labels=(("k", "v"),))
+# {'series_count': 1, 'value': 4}
+t.counter_summary("missing")                 # None：没有同名计数器
+t.counter_summary("hits", service=1)         # ValueError：service 必须是字符串
+t.counter_summary(["hits"])                  # ValueError：name 必须可哈希
+t.counter_summary("hits", labels=(("k", 1), ("k", 2)))  # ValueError：重复标签键
 ```
 
 ## sample_summary 示例
