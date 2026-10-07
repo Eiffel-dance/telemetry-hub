@@ -3931,6 +3931,221 @@ class TelemetryHistogramSummaryTest(unittest.TestCase):
         self.assertEqual(t.digest(), Telemetry.restore(t.json()).digest())
 
 
+class TelemetrySamplePercentileTest(unittest.TestCase):
+    def _build(self):
+        t = Telemetry()
+        # 默认服务、无标签序列：1, 2
+        t.observe("lat", 1)
+        t.observe("lat", 2)
+        # 默认服务、带标签序列：4, 8
+        t.observe("lat", 4, labels=(("k", "v"),))
+        t.observe("lat", 8, labels=(("k", "v"),))
+        # api 服务、无标签序列：16, 32, 64
+        t.observe("lat", 16, service="api")
+        t.observe("lat", 32, service="api")
+        t.observe("lat", 64, service="api")
+        # 其他名称不应混入
+        t.observe("other", 100)
+        t.observe("other", 200, service="api")
+        return t
+
+    def test_merges_same_name_series_and_interpolates(self):
+        t = self._build()
+        # 合并后的数值副本升序为 [1, 2, 4, 8, 16, 32, 64]
+        result = t.sample_percentile("lat", 50)
+        self.assertEqual(result, 8.0)  # 位置 (7-1)*50/100 = 3，直接取第 3 项
+        self.assertIsInstance(result, float)
+        # 位置 1.5：在 2 与 4 之间线性插值
+        self.assertEqual(t.sample_percentile("lat", 25), 3.0)
+        # q 为 0 / 100 分别返回最小值 / 最大值
+        self.assertEqual(t.sample_percentile("lat", 0), 1.0)
+        self.assertEqual(t.sample_percentile("lat", 100), 64.0)
+        # int 形式的 q 同样接受
+        self.assertEqual(t.sample_percentile("lat", 100), 64.0)
+        self.assertIsInstance(t.sample_percentile("lat", 0), float)
+
+    def test_q_validation_rejects_bad_values_before_reading_samples(self):
+        t = self._build()
+        for bad in (True, False, "50", None, [50], object()):
+            with self.assertRaises(ValueError):
+                t.sample_percentile("lat", bad)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                t.sample_percentile("lat", bad)
+        for bad in (-1, -0.5, 100.5, 101, 10 ** 400):
+            with self.assertRaises(ValueError):
+                t.sample_percentile("lat", bad)
+        # 非法 q 先于历史值转换：坏 q + 坏数据并存时仍是参数 ValueError
+        t.samples[("web", "lat", ())] = [object()]
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", float("nan"))
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 200)
+
+    def test_service_filter_none_empty_and_named(self):
+        t = self._build()
+        # 省略 service 与显式 None 等价：匹配全部服务
+        self.assertEqual(t.sample_percentile("lat", 50), 8.0)
+        self.assertEqual(
+            t.sample_percentile("lat", 50),
+            t.sample_percentile("lat", 50, service=None),
+        )
+        # 空字符串精确匹配默认服务：合并 [1, 2, 4, 8]，位置 1.5 插值为 3.0
+        self.assertEqual(t.sample_percentile("lat", 50, service=""), 3.0)
+        # 具名服务精确匹配：合并 [16, 32, 64]
+        self.assertEqual(t.sample_percentile("lat", 50, service="api"), 32.0)
+        self.assertIsNone(t.sample_percentile("lat", 50, service="web"))
+        for bad in (1, 1.5, b"api", ["api"], object()):
+            with self.assertRaises(ValueError):
+                t.sample_percentile("lat", 50, service=bad)
+
+    def test_labels_filter_none_empty_and_specific(self):
+        t = self._build()
+        # None 匹配全部标签集合
+        self.assertEqual(t.sample_percentile("lat", 50, labels=None), 8.0)
+        # 显式空序列只匹配无标签样本：合并 [1, 2, 16, 32, 64]，位置 2 取 16
+        self.assertEqual(t.sample_percentile("lat", 50, labels=()), 16.0)
+        # 具名标签按归一化后的完整集合精确匹配：合并 [4, 8]，位置 0.5 插值
+        self.assertEqual(
+            t.sample_percentile("lat", 50, labels=(("k", "v"),)), 6.0
+        )
+        # 标签输入顺序不影响匹配
+        t.observe("lat2", 3, labels=(("a", 1), ("b", 2)))
+        t.observe("lat2", 7, labels=(("a", 1), ("b", 2)))
+        self.assertEqual(
+            t.sample_percentile("lat2", 50, labels=(("b", 2), ("a", 1))), 5.0
+        )
+        # 没有该标签集合时返回 None
+        self.assertIsNone(t.sample_percentile("lat", 50, labels=(("k", "x"),)))
+        # 重复键、不可严格 JSON 序列化的值统一 ValueError
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 50, labels=(("k", 1), ("k", 2)))
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 50, labels=(("k", float("nan")),))
+
+    def test_service_and_labels_filter_combined(self):
+        t = self._build()
+        self.assertEqual(
+            t.sample_percentile("lat", 50, labels=(), service="api"), 32.0
+        )
+        self.assertIsNone(
+            t.sample_percentile("lat", 50, labels=(("k", "v"),), service="api")
+        )
+        self.assertIsNone(
+            t.sample_percentile("lat", 50, labels=(), service="web")
+        )
+
+    def test_missing_name_and_empty_series_return_none(self):
+        t = self._build()
+        self.assertIsNone(t.sample_percentile("nope", 50))
+        # 空聚合器
+        self.assertIsNone(Telemetry().sample_percentile("lat", 50))
+        # 同名序列存在但全部为空（max_values_per_series=0）不参与合并
+        trimmed = Telemetry(max_values_per_series=0)
+        trimmed.observe("lat", 1)
+        trimmed.observe("lat", 2, service="api")
+        self.assertIsNone(trimmed.sample_percentile("lat", 50))
+        # 一条非空加一条空：只统计非空序列
+        mixed = Telemetry(max_values_per_series=1)
+        mixed.observe("lat", 1)
+        mixed.observe("lat", 2)  # 窗口只保留 [2]
+        mixed.samples[("api", "lat", ())] = []  # 直接构造空序列
+        self.assertEqual(mixed.sample_percentile("lat", 50), 2.0)
+
+    def test_unhashable_name_rejected_before_reading_samples(self):
+        t = self._build()
+        with self.assertRaises(ValueError):
+            t.sample_percentile(["lat"], 50)
+        with self.assertRaises(ValueError):
+            t.sample_percentile({"a": 1}, 50)
+
+    def test_unconvertible_values_rejected_without_partial_result(self):
+        t = Telemetry()
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        # 不可转换的历史值：统一 ValueError，不返回部分结果
+        t.samples[("web", "lat", ())] = [4, object()]
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 50)
+        # 超大整数溢出同样归一为 ValueError
+        t.samples[("web", "lat", ())] = [10 ** 400]
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 50)
+        # 自定义 __float__ 抛异常也统一为 ValueError
+        class ExplodingValue:
+            def __float__(self):
+                raise RuntimeError("boom")
+
+        t.samples[("web", "lat", ())] = [ExplodingValue()]
+        with self.assertRaises(ValueError):
+            t.sample_percentile("lat", 50)
+        # 筛选未命中坏数据序列时不受影响
+        self.assertEqual(t.sample_percentile("lat", 50, service=""), 1.0)
+
+    def test_does_not_read_clock_or_mutate_state(self):
+        class BoomClock:
+            def __call__(self):
+                raise AssertionError("clock must not be called")
+
+        t = Telemetry(BoomClock())
+        t.observe("lat", 3)
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        before = t.snapshot()
+        before_digest = t.digest()
+        before_values = {
+            key: list(values) for key, values in t.samples.items()
+        }
+        self.assertEqual(t.sample_percentile("lat", 50), 2.0)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.digest(), before_digest)
+        # values 顺序不被排序副本回写
+        self.assertEqual(t.samples, before_values)
+        # 输入标签不被修改
+        labels = [("b", 2), ("a", 1)]
+        t.observe("tagged", 5, labels=labels)
+        t.sample_percentile("tagged", 50, labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+
+    def test_result_is_repeatable_plain_float(self):
+        t = self._build()
+        first = t.sample_percentile("lat", 25)
+        second = t.sample_percentile("lat", 25)
+        self.assertEqual(first, second)
+        self.assertIsInstance(first, float)
+        self.assertNotIsInstance(first, bool)
+
+    def test_works_after_restore_merge_and_batch(self):
+        t = self._build()
+        expected = t.sample_percentile("lat", 50)
+        # restore 得到的样本遵循同一规则
+        restored = Telemetry.restore(t.json())
+        self.assertEqual(restored.sample_percentile("lat", 50), expected)
+        # merge_snapshot 得到的样本同样可查询
+        merged = Telemetry()
+        merged.merge_snapshot(t.snapshot())
+        self.assertEqual(merged.sample_percentile("lat", 50), expected)
+        # batch 写入的样本同样可查询
+        batched = Telemetry()
+        batched.batch(
+            [
+                {"op": "observe", "name": "x", "value": value}
+                for value in (0, 1, 2, 3)
+            ]
+        )
+        self.assertEqual(batched.sample_percentile("x", 50), 1.5)
+
+    def test_does_not_add_snapshot_json_or_digest_fields(self):
+        t = self._build()
+        t.sample_percentile("lat", 50)
+        snapshot = t.snapshot()
+        self.assertEqual(set(snapshot), {"counters", "samples", "spans"})
+        encoded = t.json()
+        self.assertNotIn("sample_percentile", encoded)
+        # digest 不受查询影响
+        self.assertEqual(t.digest(), Telemetry.restore(t.json()).digest())
+
+
 class TelemetrySpansByStartTimeTest(unittest.TestCase):
     def build(self):
         t = Telemetry(iter(range(1000)).__next__)
