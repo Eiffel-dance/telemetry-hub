@@ -951,6 +951,148 @@ class Telemetry:
             "duration_mean": duration_mean,
         }
 
+    def trace_critical_path(self, span, service=None):
+        """离线诊断：从一条跨度出发求同服务父子树上的最长耗时链（关键路径）。
+
+        service 归一化规则与 start/finish/trace 一致（缺省为默认服务，显式
+        传入必须是非空字符串），跨度标识不可哈希时抛 ValueError；两类拒绝
+        都发生在读取任何跨度之前。根跨度不存在返回 None。
+
+        可达关系与 trace 完全一致：从根跨度出发，只沿同一服务内 parent 与
+        当前跨度标识精确相等的直接父子关系展开，父标识指向其他服务或不存在
+        的跨度（含不可哈希父标识）按无子节点处理。先对根可达的整棵关系树
+        检测环，发现环抛 ValueError 且不返回部分结果。
+
+        随后只把 end 已写入的跨度作为链路候选：根未结束（或没有可结束链）
+        时返回 None；每个开放节点本身及其后代都不进入链路，已结束节点只能
+        经由同样已结束的直接子节点向下延伸，没有可延伸子链时链路只含自身。
+        所有根可达的已结束跨度（含位于开放节点之下、不会进入链路者）的
+        start 与 end 都按现有样本统计的有限浮点规则转换后相减：转换失败、
+        NaN、无穷、超大整数溢出或自定义 __float__ 抛异常都统一抛 ValueError，
+        且先完成全部转换再选择链路，绝不返回部分结果；未结束跨度的时间戳
+        不会被读取转换。
+
+        返回与内部状态隔离的全新字典，只含 span、service、duration、spans：
+        span 与 service 为入参标识与归一化后的服务；spans 是从根到终点的
+        独立记录数组，字段与 query 完全一致（span/service/parent/start/end/
+        error，有标签时附加可安全修改的 labels），每项再增加该跨度的
+        duration（Python float，end 的 float 减 start 的 float），error
+        原值（含异常实例）原样保留。每个节点选择子链耗时总和最大的直接子
+        节点，同分时取现有服务、开始时间、标识稳定排序靠前者；顶层 duration
+        自 0.0 起按 spans 的数组顺序累加。整个过程纯只读：不读取 clock、不
+        联网、不修改聚合、输入与任何快照，duration 不写入 snapshot/json/
+        digest/diff_snapshots，返回结果可安全修改且重复调用一致；query、
+        trace、恢复、合并与批量回放的既有行为保持原状。
+        """
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        record = self.spans.get((service, span))
+        if record is None:
+            return None
+
+        # 与 trace/trace_summary 相同的预索引：同一服务内 parent -> 子跨度
+        # 标识；不可哈希的父标识无法精确等于任何跨度键，按无子节点处理。
+        children_by_parent = {}
+        for (child_service, child_span), child_record in self.spans.items():
+            if child_service != service:
+                continue
+            parent = child_record["parent"]
+            try:
+                children_by_parent.setdefault(parent, []).append(child_span)
+            except TypeError:
+                continue
+
+        # 第一步：沿与 trace 完全相同的可达关系遍历整棵树，每层按服务、
+        # 开始时间、标识稳定排序后先根收集；重复到达即成环，抛 ValueError
+        # 且不产生任何部分结果。
+        visited = set()
+        ordered = []  # (span, record) 按 trace 的稳定先根顺序收集
+
+        def walk(node_span, node_record):
+            key = (service, node_span)
+            if key in visited:  # 每个跨度只有一个父标识，重复到达即成环
+                raise ValueError("cycle detected in span parent references")
+            visited.add(key)
+            ordered.append((node_span, node_record))
+            children = [
+                (child_span, self.spans[(service, child_span)])
+                for child_span in children_by_parent.get(node_span, ())
+            ]
+            children.sort(
+                key=lambda item: _OrderableTuple(
+                    (service, item[1]["start"], item[0])
+                )
+            )
+            for child_span, child_record in children:
+                walk(child_span, child_record)
+
+        walk(span, record)
+
+        # 根自身未结束：开放节点及其后代都不能进入链路，没有可结束链可言。
+        if record["end"] is None:
+            return None
+
+        # 第二步：对全部根可达的已结束跨度（含开放节点之下、不会入选者）
+        # 统一转换 start/end：任一失败即 ValueError，先转换完再选择链路，
+        # 保证绝不返回部分结果。每项耗时为 end 的 float 减 start 的 float。
+        durations = {}
+        for node_span, node_record in ordered:
+            if node_record["end"] is None:
+                continue
+            started_at = self._finite_float(node_record["start"])
+            ended_at = self._finite_float(node_record["end"])
+            durations[(service, node_span)] = ended_at - started_at
+
+        # 第三步：自根向下只在已结束节点间延伸。开放子节点整体跳过（其后代
+        # 必经该开放节点，自然一并排除）。子节点按 trace 的同一稳定顺序
+        # 枚举，仅在子链耗时总和严格更大时替换，因此总和同分即取稳定排序
+        # 靠前者；没有可延伸的已结束子链时只含自身。环已在 walk 阶段排除。
+        def choose(node_span):
+            children = [
+                (child_span, self.spans[(service, child_span)])
+                for child_span in children_by_parent.get(node_span, ())
+            ]
+            children.sort(
+                key=lambda item: _OrderableTuple(
+                    (service, item[1]["start"], item[0])
+                )
+            )
+            best_path = None
+            best_total = None
+            for child_span, child_record in children:
+                if child_record["end"] is None:
+                    continue  # 开放节点本身及其后代不进入链路
+                child_total, child_path = choose(child_span)
+                if best_total is None or child_total > best_total:
+                    best_total = child_total
+                    best_path = child_path
+            path = [node_span] if best_path is None else [node_span] + best_path
+            # 子链比较所用的总和同样自 0.0 起按该链数组顺序累加。
+            total = 0.0
+            for item_span in path:
+                total += durations[(service, item_span)]
+            return total, path
+
+        _, chosen = choose(span)
+
+        # _span_entry 与 query 同一构造点：记录及嵌套可变容器均为全新对象，
+        # 异常等不可复制对象保持原值；有标签时附加可安全修改的 labels。
+        entries = []
+        for node_span in chosen:
+            node_record = self.spans[(service, node_span)]
+            entry = self._span_entry(service, node_span, node_record)
+            entry["duration"] = durations[(service, node_span)]
+            entries.append(entry)
+        total = 0.0
+        for entry in entries:  # 整条链的 duration 按数组顺序自 0.0 累加
+            total += entry["duration"]
+        return {
+            "span": span,
+            "service": service,
+            "duration": total,
+            "spans": entries,
+        }
+
     @staticmethod
     def _check_percentile_q(q):
         # 只接受非 bool 的 int/float：bool 是 int 的子类，必须显式排除；

@@ -19,6 +19,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `start(span, parent=None, service=None, labels=())` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。`start` 可携带可选 `labels`，标签沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，归一化只构造新结构、不改写调用方对象；标签在跨度开始时确定并随记录保存，`finish` 只结束已有的 service/span 跨度，不能改写标签。`start` 写入前先完成 service、span 与 labels 校验（service 缺省归一化为空字符串，显式传入必须是非空字符串；span 必须可哈希），相同 service/span 标识已存在跨度时——无论仍未结束还是已经结束——都抛 `ValueError`，不覆盖原有 parent/start/end/error/labels，也不推进 clock；首次创建成功时以一次 clock 结果作为 `start`，返回 `None`。`finish` 只结束当前存在且 `end` 仍为空的跨度：标识不存在或跨度已结束时抛 `ValueError`，不改变任何聚合数据、不生成新的时间戳；有效调用把 `end` 设为一次 clock 结果、把 `error` 设为传入值并返回 `None`。start/finish 收到不可哈希 span 一律抛 `ValueError`，所有被拒绝的调用都不留下半条记录，也不影响其他服务的数据。
 - `query(status, service=None, labels=None)`：仅接受 `'open'`（`end` 为空）、`'closed'`（`end` 已写入，成功结束与带异常结束都算）和 `'error'`（已结束且 `error` 非空），其他字符串、空值或非字符串值抛 `ValueError`（拒绝时不调用 clock、不留部分结果），无匹配返回 `[]`；`service` 为可选筛选，语义与 `snapshot()`/`json()` 的服务筛选一致：省略（或显式 `None`）即不按服务限制，结果与只传 `status` 时逐项一致，提供时只能是字符串，空字符串表示默认服务，数字、字节串、列表等其他类型抛 `ValueError`；`labels` 为可选标签筛选，省略（或显式 `None`）匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空序列只命中无标签记录），非法标签抛 `ValueError`，任何被拒绝的调用都不读取 clock、不改变聚合状态；结果含 `span/service/parent/start/end/error`，有标签的跨度附加可安全修改的 `labels` 字段，按服务、开始时间、标识排序；返回值为独立列表与独立记录，调用方修改不影响聚合器，`error` 原值（含异常对象）保留。
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，有标签的节点附加可安全修改的 `labels` 字段，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
+- `trace_critical_path(span, service=None)`：只读的同服务父子树最长耗时链（关键路径）查询，用于离线诊断从一条跨度出发定位耗时最长的调用链，调用方不需要先导出快照，全程不联网。service 归一化规则与 `start`/`finish`/`trace` 一致（缺省为默认服务，显式传入必须是非空字符串），跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`。树的可达关系与 `trace` 完全一致：只沿同一服务内 parent 与当前跨度标识精确相等的直接子节点展开，父标识指向其他服务或不存在的跨度（含不可哈希父标识）按无子节点处理；先对根可达的整棵关系树检测环，发现环抛 `ValueError` 且不返回部分结果。随后只把 `end` 已写入的跨度作为候选：根未结束或没有可结束链时返回 `None`，开放节点本身及其后代都不进入链路，已结束节点只能经由同样已结束的直接子节点延伸；所有根可达的已结束跨度（含位于开放节点之下、不会入选者）的 `start` 与 `end` 都按现有样本统计的有限浮点规则校验，转换失败、NaN、无穷、超大整数溢出或自定义转换异常统一抛 `ValueError`，且先完成全部转换再选择链路，不返回部分结果，未结束跨度的时间戳不会被读取转换。成功返回全新字典，只含 `span`、`service`、`duration`、`spans`：`spans` 是从根到终点的独立记录数组，字段与 `query` 完全一致（`span`/`service`/`parent`/`start`/`end`/`error`，有标签时附加可安全修改的 `labels`），并为每项增加该跨度的 `duration`（Python float，`float(end) - float(start)`），`error` 原值（含异常对象）原样保留；每个节点选择子链耗时总和最大的直接子节点，同分时取现有服务、开始时间、标识稳定排序靠前者，没有可延伸子链时空链只含自身；顶层 `duration` 自 `0.0` 起按 `spans` 数组顺序累加。返回值修改不回写聚合器；该入口纯只读：不读 clock、不联网，`duration` 不写入 `snapshot()`/`json()`/`digest`/`diff_snapshots`，恢复、合并与 `batch` 产生的跨度同样可查询，既有 `query`、`trace` 及所有异常行为保持不变。
 - `percentile(name, q, labels=(), service=None)`：只读的分位数查询，用于离线诊断样本分布，调用方不需要先导出或修改聚合器状态。`service` 与 `labels` 的归一化规则与 `observe` 完全一致（`service` 缺省归一化为空字符串，显式传入必须是非空字符串；标签按键字典序归一化，重复键或不可 JSON 序列化抛 `ValueError`），`name` 必须可哈希才能作为样本键，不可哈希抛 `ValueError`。`q` 只接受非 `bool` 的 `int`/`float`，必须为有限值且落在 `[0, 100]` 闭区间，否则统一抛 `ValueError`；任何拒绝都发生在读取样本之前——不读 clock、不改变计数器、样本、跨度或输入对象，也不产生部分结果。样本键不存在或序列为空返回 `None`；命中时按公开浮点规则把每个值转换为数值并升序排序（排序副本不回写 `values`），以位置 `(n-1)*q/100` 线性插值，位置为整数时直接取该项，`q=0`/`q=100` 分别得到最小值/最大值，返回 Python `float`。该入口只读取当前聚合，重复调用结果相同，也不新增 `snapshot()`/`json()` 字段。
 - `histogram(name, boundaries, labels=(), service=None)`：只读的数值分布计数，用于离线诊断，调用方不需要先导出或修改聚合器状态。`service`、`labels` 与 `name` 的定位、默认服务、标签规范化与精确匹配规则与 `observe`/`percentile` 完全一致，非法值统一抛 `ValueError`。`boundaries` 必须是非空 `list` 或 `tuple`，元素必须是非 `bool` 的 `int`/`float`、有限且严格递增，任一不合法统一抛 `ValueError`，且全部边界校验在读取样本之前完成（不读 clock、不产生部分结果）。样本键不存在或序列为空返回 `None`；命中时每个样本先按 `observe` 的规则转成有限 `float`（已有数据无法转换时同样抛 `ValueError`，不返回部分结果），再按左开右闭分桶：第一桶统计小于等于 `boundaries[0]`，中间桶统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。返回全新字典，只含 `boundaries`（与输入顺序一致的独立列表）、`counts`（长度为 `len(boundaries)+1` 的整数列表）与 `count`（各桶计数之和）。每次调用都重新构造结果，修改返回值不影响内部状态，不读 clock、不改变样本顺序、也不触发序列化；该入口不改变 `percentile`/`snapshot()`/`json()` 的字段与结果。
 - `counter_summary(name, labels=None, service=None)`：只读的同名计数器汇总查询，用于离线诊断时一次查看同名计数器跨多个序列（服务、完整标签集合不同）的累加结果，调用方不需要先导出快照再自行拼接，全程不联网。`name` 必须可哈希，不可哈希统一抛 `ValueError`。`service` 省略或显式 `None` 匹配所有服务；提供时与快照筛选一致，只能是字符串，空字符串表示默认服务，数字、字节串、列表等其他类型统一抛 `ValueError`。`labels` 省略或显式 `None` 匹配所有完整标签集合；提供时沿用 `inc`/`observe` 的成对标签规则：按键排序、拒绝重复键和不能严格 JSON 表示的值，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签序列）。任何非法参数都在读取计数器之前统一抛 `ValueError`：不读 clock、不产生部分结果、不修改聚合状态与输入标签。查询只选取名称完全相等且满足筛选的计数器，选择顺序沿用快照对服务、名称、标签的稳定排序，只由该排序决定，不受字典插入顺序影响。对选中的每个序列取当前 `value`，自数字 `0` 起按上述顺序逐个使用既有计数器的加法语义（Python 原生 `+`）累加——不把 `value` 隐式转成浮点，保留 Python 加法所得的原生类型（如 `int`、`float`、`Decimal`）；任意值无法参与加法或加法过程抛出异常时统一抛 `ValueError`，且在全部值处理完成前不返回部分结果。成功时返回全新字典，只含 `series_count` 和 `value`：`series_count` 是选中序列数（Python `int`），`value` 是确定顺序累加后的结果；没有匹配序列返回 `None`。返回字典及其中可变值与内部状态互不共享，重复调用结果相同；该查询纯只读，不读取 clock、不联网、不修改聚合、容量、输入标签或任何快照，不向 `snapshot`/`json`/`digest`/`diff_snapshots` 增加字段，恢复、合并与 `batch` 产生的计数器同样可查询，`inc`、`observe`、`start`、`finish`、`query`、`trace` 及既有异常和排序行为保持不变。
@@ -36,6 +37,35 @@ Tests: python3 -m unittest discover -s tests -v
 - `batch(events)`：离线诊断数据的批量回放入口，按输入顺序一次提交，成功返回 `None`。`events` 只能是事件对象（dict）组成的列表或元组；每个事件以 `op` 指定 `inc`、`observe`、`start` 或 `finish`，其余字段沿用对应公开入口的名称（`name`/`value`/`labels`/`span`/`parent`/`error`/`service`，其中 `start` 事件可携带 `labels`）、默认值（`value=1`、`labels=()`、`parent=None`、`error=None`、`service=None`）与校验规则；批次内后续事件可以使用前面事件刚建立的跨度。空批次视为成功且不改变状态。成功提交后 `snapshot`/`json`/`query`/`trace` 的结果与按同一顺序直接调用对应入口完全一致，每个 `start`/`finish` 仍只读取一次 clock 且读取次序相同。事件不是对象、不是列表/元组、`op` 缺失或未知、字段不属于所选操作、缺失必需字段（`name`/`span`、observe 的 `value`），或事件值违反服务、标签、样本、跨度规则（含重复开始、结束不存在或已结束的跨度），统一抛 `ValueError`。提交具有原子可见性：任何事件被拒绝时计数器、样本、跨度、查询结果与后续快照保持调用前状态，且拒绝判定阶段不读取 clock；提交阶段 clock 自身抛出的异常原样向调用方传播并同样恢复调用前状态。批量入口不修改传入事件对象或其中的标签和值，也不新增快照字段。
 - `digest(service=None, labels=None, status=None)`：快照完整性指纹，用于离线诊断确认两份结果是否来自同一聚合状态。视图生成规则与 `snapshot()`/`json()` 完全一致——同一组 service/labels/status 筛选、同样的稳定排序（计数器和样本按服务、名称、标签，跨度按服务、开始时间、标识）、样本统计按原规则重算、不可严格 JSON 表示的 `error` 按 `json()` 既有规则替换为只含 type/message 的占位对象；指纹就是对该视图紧凑 JSON 文本（`sort_keys=True`、`separators=(",", ":")`）的 UTF-8 字节计算 SHA-256，返回固定 64 个字符的小写十六进制字符串。相同聚合状态与同一组筛选重复调用必然得到相同指纹；计数值、样本原值、跨度父子关系、标签、结束状态或异常内容变化后，受影响视图的指纹改变。筛选只决定哪些数组条目进入摘要，绝不写入、清空或重排聚合器，也不向 `snapshot()`/`json()` 新增字段（digest 不会出现在任何快照中）。非法筛选与 `json()` 一样在读取聚合前抛 `ValueError`；整个过程纯只读：不读取 clock、不联网、不写文件、不改写任何输入；紧凑 JSON 无法按既有 json 规则完成时统一抛 `ValueError`。
 - `Telemetry.verify_digest(payload, expected, service=None, labels=None, status=None)`：回放前校验外部快照，返回严格的 `True`/`False`。`payload` 的接受范围与 `restore` 完全一致（`snapshot()` 字典、`json()` 文本或 UTF-8 字节），遵循同一版本兼容范围：先按既有快照格式、标签、重复记录、统计一致性与跨度父子引用规则完成解析（无法恢复时抛 `SnapshotFormatError`），再以规范化后的当前视图（同一组筛选、排序、统计重算与异常占位规则）计算指纹。因此字典键顺序、标签输入顺序和可由 values 重算的样本统计字段不会造成误判。`expected` 只能是恰好 64 个字符的小写十六进制字符串，格式不合法抛 `ValueError`；非法筛选抛 `ValueError`，且 expected 格式与筛选校验先于 payload 解析。校验全部通过后摘要匹配返回 `True`，格式正确但摘要不同返回 `False`。全程不读取 clock、不联网、不写文件、不改写输入，紧凑 JSON 无法按既有 json 规则生成时统一抛 `ValueError`。
+
+## trace_critical_path 示例
+
+```python
+t = Telemetry(iter([0,1,2, 9, 3,7, 4,8, 10, 12]).__next__)
+t.start("r")                    # r: start 0
+t.start("a", parent="r")        # a: start 1
+t.start("b", parent="r")        # b: start 2
+t.finish("r", error="boom")     # r: end 9（dur 9，error 原值保留）
+t.start("a1", parent="a")       # a1: start 3
+t.finish("a")                   # a: end 7（dur 6）
+t.start("b1", parent="b")       # b1: start 4
+t.finish("b")                   # b: end 8（dur 6）
+t.finish("a1")                  # a1: end 10（dur 7）-> r+a+a1 = 22
+t.finish("b1")                  # b1: end 12（dur 8）-> r+b+b1 = 23 最长
+
+cp = t.trace_critical_path("r")
+[e["span"] for e in cp["spans"]]
+# ['r', 'b', 'b1']：每节点取子链耗时总和最大者，同分按 start、span 排序
+cp["duration"]                  # 9.0 + 6.0 + 8.0 = 23.0，自 0.0 按数组顺序累加
+[e["duration"] for e in cp["spans"]]   # [9.0, 6.0, 8.0]
+cp["spans"][0]["error"]         # 'boom'：与 query 一样原值保留
+cp["span"] == "r" and cp["service"] == ""
+
+Telemetry().trace_critical_path("r")   # None：根跨度不存在
+# 开放根（即使有已结束后代）返回 None；开放节点及其后代不进入链路
+t.trace_critical_path(["r"])            # ValueError：span 必须可哈希
+t.trace_critical_path("r", service=1)   # ValueError：service 规则同 start
+```
 
 ## percentile 示例
 

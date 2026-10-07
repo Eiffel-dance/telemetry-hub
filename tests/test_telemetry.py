@@ -834,6 +834,337 @@ class TelemetryTraceTest(unittest.TestCase):
             self.assertEqual(node[field], entry[field])
 
 
+class TelemetryTraceCriticalPathTest(unittest.TestCase):
+    def _tree(self, specs, service=""):
+        # specs: (span, parent, start, end) ；end 为 None 表示未结束。
+        t = Telemetry(iter(range(1000)).__next__)
+        for span, parent, start, end in specs:
+            t.spans[(service, span)] = {
+                "parent": parent, "start": start, "end": end,
+                "error": None, "labels": (),
+            }
+        return t
+
+    def test_picks_longest_total_duration_chain(self):
+        # root dur 9；b dur 7 -> b1 dur 4（链和 20）；a dur 4 -> a1 dur 1（14）
+        t = self._tree([
+            ("root", None, 0, 9),
+            ("b", "root", 1, 8), ("b1", "b", 2, 6),
+            ("a", "root", 3, 7), ("a1", "a", 4, 5),
+        ])
+        result = t.trace_critical_path("root")
+        self.assertEqual(set(result), {"span", "service", "duration", "spans"})
+        self.assertEqual(result["span"], "root")
+        self.assertEqual(result["service"], "")
+        self.assertEqual([e["span"] for e in result["spans"]],
+                         ["root", "b", "b1"])
+        self.assertEqual(result["duration"], 20.0)
+        self.assertIsInstance(result["duration"], float)
+        self.assertEqual([e["duration"] for e in result["spans"]],
+                         [9.0, 7.0, 4.0])
+        for entry in result["spans"]:
+            self.assertIsInstance(entry["duration"], float)
+
+    def test_chain_compares_subtree_sums_not_own_durations(self):
+        # A 自身 dur 100 是叶子；B dur 10 -> B1 dur 50 -> B11 dur 60，链更长。
+        t = self._tree([
+            ("r", None, 0, 1),
+            ("A", "r", 0, 100),
+            ("B", "r", 0, 10),
+            ("B1", "B", 0, 50),
+            ("B11", "B1", 0, 60),
+        ])
+        result = t.trace_critical_path("r")
+        self.assertEqual([e["span"] for e in result["spans"]],
+                         ["r", "B", "B1", "B11"])
+        self.assertEqual(result["duration"], 121.0)
+
+    def test_tie_breaks_by_start_then_span_stable_order(self):
+        # x、y 子链耗时总和相同：开始时间早者优先。
+        t = self._tree([
+            ("p", None, 0, 6),
+            ("x", "p", 1, 5),
+            ("y", "p", 2, 6),
+        ])
+        self.assertEqual(
+            [e["span"] for e in t.trace_critical_path("p")["spans"]],
+            ["p", "x"],
+        )
+        # 开始时间也相同：标识稳定排序靠前者。
+        t2 = self._tree([
+            ("p", None, 0, 6),
+            ("y", "p", 1, 5),
+            ("x", "p", 1, 5),
+        ])
+        self.assertEqual(
+            [e["span"] for e in t2.trace_critical_path("p")["spans"]],
+            ["p", "x"],
+        )
+
+    def test_empty_chain_is_self_only(self):
+        t = self._tree([("lone", None, 1, 4)])
+        result = t.trace_critical_path("lone")
+        self.assertEqual([e["span"] for e in result["spans"]], ["lone"])
+        self.assertEqual(result["duration"], 3.0)
+
+    def test_open_root_returns_none_even_with_closed_descendant(self):
+        t = self._tree([
+            ("o", None, 0, None),
+            ("oc", "o", 1, 2),
+        ])
+        self.assertIsNone(t.trace_critical_path("o"))
+
+    def test_open_node_and_its_descendants_never_enter_chain(self):
+        # 根已结束；ro 开放但其下 rog 已结束——链路只含根自身。
+        t = self._tree([
+            ("r", None, 0, 3),
+            ("ro", "r", 1, None),
+            ("rog", "ro", 2, 2.5),
+        ])
+        result = t.trace_critical_path("r")
+        self.assertEqual([e["span"] for e in result["spans"]], ["r"])
+        self.assertEqual(result["duration"], 3.0)
+        # 开放分支与已结束分支并存时只走已结束分支。
+        t2 = self._tree([
+            ("r", None, 0, 9),
+            ("open", "r", 1, None),
+            ("ok", "r", 2, 8), ("ok1", "ok", 3, 4),
+        ])
+        self.assertEqual(
+            [e["span"] for e in t2.trace_critical_path("r")["spans"]],
+            ["r", "ok", "ok1"],
+        )
+
+    def test_missing_root_returns_none(self):
+        t = self._tree([("a", None, 0, 1)])
+        self.assertIsNone(t.trace_critical_path("nope"))
+        self.assertIsNone(t.trace_critical_path("a", service="web"))
+
+    def test_invalid_arguments_raise_before_reading_spans(self):
+        t = self._tree([("a", None, 0, 1)])
+        for bad in ("", 1, b"x"):
+            with self.assertRaises(ValueError):
+                t.trace_critical_path("a", service=bad)
+        for bad in (["a"], {"s": 1}):
+            with self.assertRaises(ValueError):
+                t.trace_critical_path(bad)
+
+        class AssertingClock:
+            def __call__(self):
+                raise AssertionError("clock must not be read")
+
+        t.clock = AssertingClock()
+        with self.assertRaises(ValueError):
+            t.trace_critical_path(["a"])
+        with self.assertRaises(ValueError):
+            t.trace_critical_path("a", service=1)
+        self.assertIsNone(t.trace_critical_path("missing"))
+
+    def test_reachability_matches_trace_same_service_exact_parent(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        # 默认服务树：root -> child；api 服务也有 root，且 x 的 parent 字符串
+        # 恰好是 "root" 但属于 api，不得进入默认服务链路。
+        t.spans[("", "root")] = {
+            "parent": None, "start": 0, "end": 2,
+            "error": None, "labels": (),
+        }
+        t.spans[("", "child")] = {
+            "parent": "root", "start": 1, "end": 3,
+            "error": None, "labels": (),
+        }
+        t.spans[("api", "root")] = {
+            "parent": None, "start": 0, "end": 5,
+            "error": None, "labels": (),
+        }
+        t.spans[("api", "x")] = {
+            "parent": "root", "start": 1, "end": 4,
+            "error": None, "labels": (),
+        }
+        # 父标识指向不存在跨度的孤儿按无子节点处理。
+        t.spans[("", "orphan")] = {
+            "parent": "ghost", "start": 0, "end": 1,
+            "error": None, "labels": (),
+        }
+        self.assertEqual(
+            [e["span"] for e in t.trace_critical_path("root")["spans"]],
+            ["root", "child"],
+        )
+        api = t.trace_critical_path("root", service="api")
+        self.assertEqual([e["span"] for e in api["spans"]], ["root", "x"])
+        # trace 与 critical_path 的可达集合一致：默认服务树只有 root/child。
+        tree = t.trace("root")
+        self.assertEqual([c["span"] for c in tree["children"]], ["child"])
+        self.assertEqual(tree["children"][0]["children"], [])
+        self.assertEqual(
+            [e["span"] for e in t.trace_critical_path("root")["spans"]],
+            ["root", "child"],
+        )
+
+    def test_cycle_raises_without_partial_result(self):
+        t = self._tree([
+            ("a", "b", 0, 1),
+            ("b", "a", 0, 1),
+        ])
+        before = t.snapshot()
+        with self.assertRaises(ValueError):
+            t.trace_critical_path("a")
+        self.assertEqual(t.snapshot(), before)
+        t2 = self._tree([("self", "self", 0, 1)])  # 自环
+        with self.assertRaises(ValueError):
+            t2.trace_critical_path("self")
+        # 环位于根可达分支内（含开放节点）也先检测环：r->o->x->r。
+        t3 = self._tree([
+            ("r", None, 0, 9),
+            ("o", "r", 1, None),
+            ("x", "o", 2, 3),
+        ])
+        t3.spans[("", "r")]["parent"] = "x"
+        with self.assertRaises(ValueError):
+            t3.trace_critical_path("r")
+
+    def test_all_reachable_closed_spans_converted_before_choice(self):
+        # 不在最终链路上的已结束跨度时间戳无法转换，同样整体 ValueError。
+        for bad in ("not-a-time", float("nan"), float("inf"),
+                    float("-inf"), 10 ** 400, object()):
+            t = self._tree([
+                ("r", None, 0, 9),
+                ("win", "r", 1, 8),
+                ("lose", "r", 2, bad),
+            ])
+            before = t.snapshot()
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.trace_critical_path("r")
+            self.assertEqual(t.snapshot(), before)
+
+        class Exploding:
+            def __float__(self):
+                raise RuntimeError("boom")
+
+        t = self._tree([
+            ("r", None, 0, 9),
+            ("g", "r", 1, None),
+            ("gc", "g", 2, 3),
+        ])
+        t.spans[("", "gc")]["end"] = Exploding()
+        with self.assertRaises(ValueError):
+            t.trace_critical_path("r")
+
+    def test_open_spans_timestamps_never_converted(self):
+        class Exploding:
+            def __float__(self):
+                raise AssertionError("open timestamps must not be converted")
+
+        t = self._tree([("r", None, 0, None)])
+        t.spans[("", "r")]["start"] = Exploding()
+        self.assertIsNone(t.trace_critical_path("r"))
+        t2 = self._tree([
+            ("r", None, 0, 9),
+            ("o", "r", None, None),
+        ])
+        t2.spans[("", "o")]["start"] = Exploding()
+        result = t2.trace_critical_path("r")
+        self.assertEqual([e["span"] for e in result["spans"]], ["r"])
+
+    def test_result_shape_matches_query_and_is_isolated(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        err = ValueError("boom")
+        t.spans[("", "r")] = {
+            "parent": None, "start": 0, "end": 5,
+            "error": err, "labels": (("k", "v"),),
+        }
+        t.spans[("", "c")] = {
+            "parent": "r", "start": 1, "end": 4,
+            "error": None, "labels": (),
+        }
+        result = t.trace_critical_path("r")
+        root_entry = result["spans"][0]
+        query_entry = [e for e in t.query("closed") if e["span"] == "r"][0]
+        for field in ("span", "service", "parent", "start", "end", "error",
+                      "labels"):
+            self.assertEqual(root_entry[field], query_entry[field])
+        self.assertIs(root_entry["error"], err)  # error 原值保留
+        self.assertEqual(root_entry["labels"], [("k", "v")])
+        self.assertNotIn("children", root_entry)
+        # 无标签跨度保持 query 的字段形状外加 duration。
+        self.assertEqual(
+            set(result["spans"][1]),
+            {"span", "service", "parent", "start", "end", "error",
+             "duration"},
+        )
+        # 修改返回值不回写聚合器，且不影响再次查询。
+        result["spans"][0]["labels"].append(("z", 1))
+        result["spans"][0]["span"] = "mutated"
+        result["spans"].append("junk")
+        result["duration"] = 0
+        again = t.trace_critical_path("r")
+        self.assertEqual(
+            [e["span"] for e in again["spans"]], ["r", "c"])
+        self.assertEqual(again["duration"], 8.0)
+        self.assertEqual(
+            [e for e in t.query("closed") if e["span"] == "r"][0]["labels"],
+            [("k", "v")],
+        )
+        # 重复调用返回相互独立的全新对象。
+        one = t.trace_critical_path("r")
+        two = t.trace_critical_path("r")
+        self.assertIsNot(one, two)
+        self.assertIsNot(one["spans"], two["spans"])
+        self.assertIsNot(one["spans"][0], two["spans"][0])
+
+    def test_does_not_read_clock_or_change_snapshots(self):
+        class AssertingClock:
+            reads = 0
+
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("clock must not be read")
+
+        t = self._tree([
+            ("r", None, 0, 9),
+            ("a", "r", 1, 8), ("a1", "a", 2, 3),
+            ("b", "r", 3, 4),
+        ])
+        before = t.snapshot()
+        digest_before = t.digest()
+        t.clock = AssertingClock()
+        result = t.trace_critical_path("r")
+        self.assertEqual([e["span"] for e in result["spans"]],
+                         ["r", "a", "a1"])
+        self.assertEqual(AssertingClock.reads, 0)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.digest(), digest_before)
+        self.assertNotIn("duration", t.json())
+        diff = Telemetry.diff_snapshots(Telemetry().snapshot(), before)
+        self.assertFalse(
+            any("duration" in e for e in diff["spans"]["added"])
+        )
+
+    def test_works_after_restore_merge_and_batch(self):
+        t = self._tree([
+            ("r", None, 0, 9),
+            ("b", "r", 1, 8), ("b1", "b", 2, 6),
+            ("a", "r", 3, 7),
+        ])
+        restored = Telemetry.from_snapshot(t.snapshot())
+        self.assertEqual(
+            [e["span"] for e in restored.trace_critical_path("r")["spans"]],
+            ["r", "b", "b1"],
+        )
+        merged = Telemetry()
+        merged.merge_snapshot(t.snapshot())
+        self.assertEqual(merged.trace_critical_path("r")["duration"], 20.0)
+        batched = Telemetry(clock=lambda: 7.0)
+        batched.batch([
+            {"op": "start", "span": "r"},
+            {"op": "start", "span": "x", "parent": "r"},
+            {"op": "finish", "span": "x"},
+            {"op": "finish", "span": "r"},
+        ])
+        result = batched.trace_critical_path("r")
+        self.assertEqual([e["span"] for e in result["spans"]], ["r", "x"])
+        self.assertEqual(result["duration"], 0.0)
+
+
 class TelemetryBatchTest(unittest.TestCase):
     def _events(self):
         return [
