@@ -1163,6 +1163,97 @@ class Telemetry:
             "mean": total / count,
         }
 
+    def histogram_summary(self, name, boundaries, labels=None, service=None):
+        """离线诊断：把同名的多条已记录样本序列合并为一次分桶计数，只读不改状态。
+
+        name 必须可哈希，不可哈希统一抛 ValueError。service 省略或显式 None
+        匹配全部服务；提供时沿用快照筛选语义，只能是字符串，空字符串表示默认
+        服务，其他类型一律 ValueError。labels 省略或显式 None 匹配全部完整标签
+        集合；提供时沿用 observe 的成对输入、键排序、重复键拒绝与严格 JSON
+        校验，按归一化后的完整标签集合精确匹配（显式空序列只命中无标签样本）。
+        boundaries 必须是非空 list/tuple，元素必须是非 bool 的 int/float、有限
+        且严格递增；任一不合法统一抛 ValueError。name、service、labels 与
+        boundaries 的全部校验先于任何样本读取完成：不读 clock、不产生部分结果、
+        不修改聚合状态与输入对象。
+
+        命中序列的选取与排序和快照完全一致：先按快照对服务、名称、标签的
+        现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配且 values
+        非空的序列（空 values 序列不参与分桶）。每条序列内部沿用 values 的
+        写入顺序，把所有值按公开有限浮点规则转换后拼接：任一历史值无法转换
+        为有限数值，或转换过程出现异常（含超大整数溢出、NaN、无穷与自定义
+        __float__ 异常），统一抛 ValueError；全部值先完成转换才分桶计数，
+        绝不返回部分字典。分桶为左开右闭：第一桶统计 <= boundaries[0]，
+        中间桶统计大于前一边界且不超过当前边界，最后一桶统计大于最后边界。
+
+        成功返回全新字典，只含与输入顺序一致的 boundaries 独立列表、长度为
+        len(boundaries)+1 的 counts 整数列表与 count（各桶之和）。没有匹配的
+        非空序列时返回 None。整个过程纯只读：不联网、不调用 clock、不修改
+        聚合器、输入标签或既有 values，不写入 snapshot/json/digest 或恢复
+        载荷，也不新增快照字段；返回结果可安全修改，重复调用结果一致。
+        """
+        # 全部入站校验先于样本读取：name 可哈希；service 沿用快照筛选语义；
+        # labels 省略/None 匹配全部标签集合，提供时按 observe 规则归一化；
+        # 边界全部校验并复制，非法边界绝不接触任何样本或产生部分结果。
+        self._restore_hashable(name, "name")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        boundaries = self._check_histogram_boundaries(boundaries)
+        # 先按快照对 (service, name, labels) 的稳定顺序排列全部序列，再按
+        # 名称与筛选挑出非空序列：相对顺序与同条件快照中同名条目逐项一致。
+        ordered_keys = [
+            key
+            for key, _ in sorted(
+                self.samples.items(),
+                key=lambda item: _OrderableTuple(item[0]),
+            )
+        ]
+        selected = []
+        for svc, key_name, key_labels in ordered_keys:
+            try:
+                matches = (
+                    key_name == name
+                    and (service is None or svc == service)
+                    and (labels is None or key_labels == labels)
+                )
+            except Exception as exc:
+                # 自定义标识的比较异常同样属于入参非法，统一为 ValueError。
+                raise ValueError("invalid histogram_summary selector: %s" % (exc,))
+            if matches:
+                values = self.samples[(svc, key_name, key_labels)]
+                if values:  # 只有非空序列参与分桶
+                    selected.append(values)
+        # 序列顺序来自快照排序，序列内部沿用 values 写入顺序。全部值先按
+        # 公开有限浮点规则转换完才分桶：任一转换失败统一 ValueError
+        # （_finite_float 已把底层各类异常归一），不返回部分结果。
+        numbers = []
+        for values in selected:
+            for value in values:
+                numbers.append(self._finite_float(value))
+        if not numbers:  # 没有匹配的非空序列：无分布可言
+            return None
+        counts = [0] * (len(boundaries) + 1)
+        first_boundary = boundaries[0]
+        last_boundary = boundaries[-1]
+        for number in numbers:
+            # 左开右闭：第一桶 v <= b0；最后一桶 v > b_last；中间桶 i
+            # （1 <= i <= len-1）为 b_{i-1} < v <= b_i。边界严格递增，
+            # 每个值恰好落入一个桶。
+            if number <= first_boundary:
+                counts[0] += 1
+            elif number > last_boundary:
+                counts[-1] += 1
+            else:
+                for index in range(1, len(boundaries)):
+                    if number <= boundaries[index]:
+                        counts[index] += 1
+                        break
+        return {
+            "boundaries": list(boundaries),
+            "counts": counts,
+            "count": sum(counts),
+        }
+
     def span_duration_stats(self, service=None, labels=None, status="closed"):
         """离线诊断：对已结束跨度的耗时（end 减 start）做汇总，只读不改状态。
 
