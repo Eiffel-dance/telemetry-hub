@@ -24,6 +24,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `sample_summary(name, labels=None, service=None)`：只读的同名样本序列汇总，用于离线诊断时一次合并同名序列，调用方不需要先导出快照再自行合并，全程不联网。`name` 必须可哈希，不可哈希统一抛 `ValueError`。`service` 省略或显式 `None` 匹配所有服务；提供时只能是字符串，按快照筛选语义精确匹配，空字符串表示默认服务，其他类型统一抛 `ValueError`。`labels` 省略或显式 `None` 匹配所有完整标签集合；提供时沿用 `observe` 的成对输入、键排序、重复键拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空序列只匹配无标签样本）。全部参数校验先于任何样本读取：不读 clock、不产生部分结果、不修改聚合状态与输入标签。序列选取与排序与快照完全一致：先按快照对服务、名称、标签的现有稳定顺序排列全部样本序列，再选出同名、服务与标签匹配且 `values` 非空的序列（空 `values` 序列不参与汇总）；每条序列内部沿用 `values` 的写入顺序，把所有值按公开有限浮点规则转换后合并——任一历史值无法转换为有限数值（含超大整数溢出、自定义 `__float__` 异常、NaN/无穷）或转换过程出现异常，统一抛 `ValueError`，且全部值先完成转换才形成结果，绝不返回部分字典。成功返回全新字典，只含 `series_count`、`count`、`sum`、`minimum`、`maximum`、`mean`：`series_count` 是参与汇总的非空序列数，`count` 是实际值总数，`sum` 自 `0.0` 起按上述确定顺序累加，`minimum`/`maximum` 为全体数值的最小/最大值，`mean` 等于 `sum` 除以 `count`；两个计数字段为 Python `int`，其余统计字段为 Python `float`。没有匹配序列或没有可保留值时返回 `None`。返回结果可安全修改，重复调用结果一致；该查询不写入 `snapshot`/`json`/`digest` 或恢复载荷，也不新增快照字段，现有容量限制、跨度生命周期、异常保存及恢复、合并与批量回放行为保持原状。
 - `span_duration_stats(service=None, labels=None, status="closed")`：只读的跨度耗时汇总，用于离线诊断直接读取已记录跨度的耗时，调用方不需要先导出快照，全程不联网。只统计已经结束的跨度：`status` 只接受 `'closed'` 与 `'error'`，`'closed'` 包含所有 `end` 已写入的跨度（成功结束与带异常结束都算），`'error'` 只包含其中 `error` 不为 `None` 的跨度（`0`、`False`、空容器等假值也不例外）；传入 `'open'` 或任何其他值（含 `None` 与非字符串）统一抛 `ValueError`。`service` 与 `labels` 的筛选语义与 `query` 完全一致：`service` 缺省（`None`）匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。服务、标签或状态校验失败都在读取任何跨度之前抛 `ValueError`——不读 clock、不产生部分结果、不改变聚合状态。筛选后没有已结束跨度时返回 `None`；命中时返回全新字典，含 `values`、`count`、`sum`、`minimum`、`maximum`、`mean`：`values` 按 `query`/`snapshot` 对跨度使用的稳定顺序（服务、开始时间、标识）排列，每个元素是对应跨度 `end` 与 `start` 各自按现有样本统计的有限浮点规则转换后相减得到的 Python `float`，任一结束跨度的时间戳无法转换为有限数值（含超大整数溢出、自定义 `__float__` 异常、NaN/无穷）统一抛 `ValueError` 且不返回部分结果（未结束跨度不参与统计，其时间戳不会被转换）；`count` 等于 `values` 长度，`sum` 自 `0.0` 起按 `values` 顺序累加，`minimum`/`maximum` 为这批耗时的最小/最大值，`mean` 等于 `sum` 除以 `count`。每次调用都重新构造结果字典与 `values` 列表，可安全修改，不与内部状态共享；该入口纯只读，不读 clock、不改变样本与跨度顺序，也不向 `snapshot()`/`json()` 新增字段，未结束跨度仍可通过原入口查询，异常对象的保存与 JSON 占位规则不变。
 - `spans_by_duration(minimum=None, maximum=None, service=None, labels=None, status="closed")`：只读的已结束跨度耗时区间查找，用于离线诊断直接按耗时挑出跨度，调用方不需要先导出快照，全程不联网，也不写入快照或任何内部状态。`status` 只接受 `'closed'` 与 `'error'`：`'closed'` 包含所有 `end` 已写入的跨度（成功结束与带异常结束都算），`'error'` 只包含其中 `error` 不为 `None` 的跨度（`0`、`False`、空容器等假值也不例外）；传入 `'open'` 或任何其他值（含 `None` 与非字符串）统一抛 `ValueError`。`service` 与 `labels` 的筛选语义与 `query` 完全一致：`service` 缺省（`None`）匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。`minimum`/`maximum` 省略（`None`）表示该侧无界；提供时只能是非 `bool` 的 `int`/`float` 且必须有限（`NaN`、无穷、字符串、字节串、`Decimal`、`bool` 等一律抛 `ValueError`），同时给出时 `minimum` 不得大于 `maximum`。全部条件（status、service、labels、两侧边界与区间关系）先校验通过才读取任何跨度：任一失败统一抛 `ValueError`，不读 clock、不产生部分结果、不改变聚合状态与调用方对象。候选是 `closed`/`error` 筛选后的已结束跨度（未结束跨度不进入候选、不转换也不返回），按 `query`/`snapshot` 的稳定顺序（服务、开始时间、标识）把每个候选的 `end` 与 `start` 各自按现有样本统计的有限浮点规则转换后相减（`float(end) - float(start)`）：转换失败、`NaN`、无穷、超大整数溢出或自定义 `__float__` 抛异常都统一抛 `ValueError`，且全部候选先转换完再按区间筛选，不返回部分结果。区间为闭区间 `minimum <= duration <= maximum`，缺省侧视为无界。成功返回全新列表，无匹配返回空列表；每项是 `query` 同形的独立记录（`span`、`service`、`parent`、`start`、`end`、`error`，有标签时附加可安全修改的 `labels`），再增加 `duration` 字段，值为 Python `float`；修改返回列表、记录或标签不影响聚合器，`error` 原值（含异常对象）按 `query` 保留。重复调用结果相同；该入口纯只读、不联网，`duration` 不会写入 `snapshot()`/`json()`，其他恢复、合并、批量、摘要与 JSON 行为保持原状。
+- `spans_by_start_time(minimum=None, maximum=None, service=None, labels=None, status=None)`：只读的跨度绝对开始时间区间查找，用于回放时定位某个时间段内启动的请求，调用方不需要先导出快照，全程不联网，也不写入快照、digest 或任何内部状态。`status` 缺省（`None`）保留全部跨度，提供时只能是 `open`/`closed`/`error` 并采用 `query` 的状态定义（`open` 为 `end` 为空，`closed` 为 `end` 已写入，`error` 为已结束且 `error` 非空），其他值（含非字符串）统一抛 `ValueError`；未结束跨度在缺省或 `status='open'` 时同样可查询，且只校验/转换其 `start`。`service` 与 `labels` 的筛选语义与 `query` 完全一致：`service` 缺省（`None`）匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省（`None`）匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。`minimum`/`maximum` 省略（`None`）表示该侧无界；提供时只能是非 `bool` 的 `int`/`float` 且必须有限（`NaN`、无穷、字符串、字节串、`Decimal`、`bool` 等一律抛 `ValueError`），同时给出时 `minimum` 不得大于 `maximum`。全部条件（status、service、labels、两侧边界与区间关系）先校验通过才读取任何跨度：任一失败统一抛 `ValueError`，不读 clock、不产生部分结果、不改变聚合状态与调用方对象。候选是状态与筛选命中的全部跨度，按 `query`/`snapshot` 的稳定顺序（服务、开始时间、标识）把每个候选的 `start` 按现有样本统计的有限浮点规则转换（`float(start)`）：转换失败、`NaN`、无穷、超大整数溢出或自定义 `__float__` 抛异常都统一抛 `ValueError`，且全部候选先转换完再按区间筛选，不返回部分结果。区间为闭区间 `minimum <= start <= maximum`，缺省侧视为无界。成功返回全新列表，无匹配返回空列表；每项是 `query` 同形的独立记录（`span`、`service`、`parent`、`start`、`end`、`error`，有标签时附加可安全修改的 `labels`），不附加额外字段；修改返回列表、记录或标签不影响聚合器，`error` 原值（含异常对象）按 `query` 保留。重复调用结果相同；该入口纯只读、不联网，筛选与派生值不会写入 `snapshot()`/`json()`/digest，恢复或合并得到的跨度同样可查询，其他恢复、合并、批量、摘要与 JSON 行为保持原状。
 - `snapshot(service=None, labels=None, status=None)` / `json(service=None, labels=None, status=None)`：计数器和样本按服务、名称、标签排序，跨度按服务、开始时间、标识排序；JSON 紧凑（`separators=(",", ":")`）且键序稳定（`sort_keys=True`）。三个筛选全部可省略，省略任一筛选即不按该维度限制，无参数调用结果与既有行为逐项一致，仍返回 `counters`、`samples`、`spans` 三个数组。`service` 缺省匹配全部服务，提供时只能是字符串，空字符串表示默认服务，其他类型抛 `ValueError`；`labels` 缺省匹配全部标签，提供时沿用 `observe` 的成对标签输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合与计数器/样本/跨度精确匹配（显式空序列只命中无标签记录），标签值无法通过既有规则时统一抛 `ValueError`；`status` 缺省保留所有服务的跨度，提供时只能是 `open`/`closed`/`error` 并使用 `query` 对结束与异常的既有定义。`service` 与 `labels` 对三个数组同时生效，`status` 只作用于跨度，父标识不因筛选改写。有标签的跨度条目附加 `labels` 字段（按键序的成对列表），无标签条目保持既有字段形状。任一筛选非法都在读取聚合前抛 `ValueError`——不调用 clock、不产生部分结果；没有匹配项时对应数组为空。命中的样本统计按原规则重算，排序顺序不变，返回的字典、数组与记录均为独立副本；同一组筛选可重复使用得到相同结果，筛选不写入、清空或重排内部数据。`json()` 同条件下可 JSON 表示的字段与 `snapshot()` 一致，`error` 继续按既有规则转换。
 - `Telemetry.from_snapshot(payload, clock=time.time, max_series=None)`：离线把 `snapshot()` 字典或 `json()` 文本重建为独立实例，计数器、样本原值与跨度的 parent/start/end/error/labels 全部带回，样本统计按公开浮点规则从 values 重算（输入中存在的统计字段须与重算一致，空 values 不得携带统计）。`max_series` 为重建实例的可选序列容量上限（省略或 `None` 不设限，非法值抛 `ValueError`），快照内计数器与样本序列总数超限时抛 `TelemetryCapacityError`，跨度不占配额；格式校验先于容量检查。payload 顶层只能含 `counters`、`samples`、`spans` 三个数组；跨度条目可携带可选的 `labels` 字段（成对标签数组，校验与 `observe` 一致），缺少 `labels` 的旧快照按空标签恢复；缺字段、多字段、非法 JSON、重复记录、无效标签、不可哈希跨度标识、不可严格 JSON 表示的值等一律抛 `SnapshotFormatError`（`ValueError` 的子类），且失败前不留下半成品实例、不改动已有实例。恢复过程不联网、不读写文件、不修改输入；恢复后与原对象互不共享数据，`open` 跨度可继续用 `finish()` 结束。
 - `SnapshotFormatError`：快照恢复格式错误的公开异常类型，`ValueError` 的子类。所有快照恢复入口（`from_snapshot`/`merge_snapshot`/`diff_snapshots`/`restore`/`restore_snapshot`）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失或类型错误的字段、非有限数值、无法按既有规则规范化的标签、悬空或成环的父子引用、重复跨度标识等输入问题统一抛出本异常；既有按 `ValueError` 捕获的调用方行为不变。
@@ -141,5 +142,36 @@ t.spans_by_duration(status="open")          # ValueError：status 只能是 clos
 t.spans_by_duration(minimum=True)           # ValueError：bool 不是合法边界
 t.spans_by_duration(minimum=9, maximum=1)   # ValueError：minimum 不得大于 maximum
 Telemetry().spans_by_duration()             # []：没有已结束跨度
+```
+
+## spans_by_start_time 示例
+
+```python
+t = Telemetry(iter([0,1,    # a：start 0（默认服务）
+                    2,5,    # api b：start 2
+                    4,14,   # api c：start 4
+                    15]).__next__)  # open 只有 start=15
+t.start("a"); t.finish("a", error="boom")
+t.start("b", service="api"); t.finish("b", service="api")
+t.start("c", service="api"); t.finish("c", service="api")
+t.start("open", service="api")              # 未结束，默认也参与
+
+[e["span"] for e in t.spans_by_start_time()]
+# ['a', 'b', 'c', 'open']：未结束跨度同样返回，按服务、start、span 排序
+[e["span"] for e in t.spans_by_start_time(minimum=3)]
+# ['c', 'open']：闭区间 minimum <= start
+[e["span"] for e in t.spans_by_start_time(minimum=2, maximum=4)]
+# ['b', 'c']：闭区间两侧都包含
+[e["span"] for e in t.spans_by_start_time(status="open")]
+# ['open']：沿用 query 的 open 定义
+[e["span"] for e in t.spans_by_start_time(status="error")]
+# ['a']：只含 error 非 None 的已结束跨度
+row = t.spans_by_start_time(service="api", labels=())[0]
+# {'span': 'b', 'service': 'api', 'parent': None, 'start': 2,
+#  'end': 5, 'error': None}  —— 字段与 query 一致，不附加 duration
+t.spans_by_start_time(status="bad")         # ValueError：status 只能是 open/closed/error
+t.spans_by_start_time(minimum=True)         # ValueError：bool 不是合法边界
+t.spans_by_start_time(minimum=9, maximum=1) # ValueError：minimum 不得大于 maximum
+Telemetry().spans_by_start_time()           # []：没有跨度
 ```
 

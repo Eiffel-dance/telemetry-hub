@@ -1321,6 +1321,78 @@ class Telemetry:
                 matches.append(entry)
         return matches
 
+    def spans_by_start_time(
+        self, minimum=None, maximum=None, service=None, labels=None,
+        status=None,
+    ):
+        """离线诊断：按绝对开始时间闭区间查找跨度，只读不改状态。
+
+        用于回放时定位某个时间段内启动的请求。status 缺省（None）保留全部
+        跨度，也接受 query 定义的 'open'/'closed'/'error'：open 看 end 为
+        空，closed 看 end 已写入（成功与带异常结束都包含），error 要求已
+        结束且 error 不为 None；其他值统一抛 ValueError。service 与 labels
+        的筛选语义与 query 完全一致：service 缺省（None）匹配全部服务，
+        提供时只能是字符串，空字符串表示默认服务；labels 缺省匹配全部标签，
+        提供时沿用 observe 的成对输入、键排序、重复键与严格 JSON 校验，按
+        归一化后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。
+        minimum/maximum 省略（None）表示该侧无界；提供时只能是非 bool 的
+        int/float 且必须有限，同时给出时 minimum 不得大于 maximum。status、
+        service、labels、minimum、maximum 与区间关系全部先校验通过，才读取
+        任何跨度：不读 clock、不产生部分结果、不改变聚合状态与调用方对象。
+
+        候选按 query/snapshot 的稳定顺序（服务、开始时间、标识）取状态与
+        筛选命中的跨度，未结束跨度同样是候选，且只转换其 start。每个候选的
+        start 按现有样本统计的有限浮点规则转换（float(start)）得到 Python
+        float：转换失败、NaN、无穷、超大整数溢出或自定义 __float__ 抛异常
+        都统一为 ValueError，且全部候选先转换完再按区间筛选，不返回部分
+        结果。区间为闭区间 minimum <= start <= maximum，缺省侧视为无界。
+
+        成功返回全新列表，记录字段与 query 一致（span、service、parent、
+        start、end、error，有标签时附加可安全修改的 labels）；修改返回列表、
+        记录或标签不影响聚合器，异常对象按 query 原值保留。无匹配返回空
+        列表。重复调用结果相同，整个过程纯只读、不联网，筛选与派生值不写入
+        snapshot()/json()/digest，其他恢复、合并、批量与 JSON 行为保持原状。
+        """
+        # 全部入站校验先于任何跨度读取：status 缺省或 query 的三个状态，
+        # service/labels 沿用 query 的筛选与归一化规则，两侧边界各自必须是
+        # 非 bool 的有限 int/float，且下界不得大于上界。
+        status = self._filter_status(status)
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        if minimum is not None:
+            minimum = self._check_duration_bound(minimum, "minimum")
+        if maximum is not None:
+            maximum = self._check_duration_bound(maximum, "maximum")
+        if (
+            minimum is not None
+            and maximum is not None
+            and minimum > maximum
+        ):
+            raise ValueError("minimum must not be greater than maximum")
+        # 复用跨度条目的唯一构造点：状态、服务与标签筛选和 query/snapshot
+        # 逐项一致，status=None 时未结束跨度同样进入候选，条目已按服务、
+        # 开始时间、标识稳定排序。
+        entries = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status, labels
+            )
+        ]
+        # 全部候选的开始时间先按样本统计的公开浮点规则转换：任一开始时间戳
+        # 无法转为有限数值即统一 ValueError（含超大整数溢出与自定义
+        # __float__ 异常），先完成全部转换再做区间筛选，保证不会边筛选边
+        # 失败而产生部分结果。未结束跨度只转换 start，不触碰 end。
+        starts = [self._finite_float(entry["start"]) for entry in entries]
+        matches = []
+        for entry, started_at in zip(entries, starts):
+            # 闭区间 minimum <= start <= maximum；缺省侧视为无界。
+            if (minimum is None or started_at >= minimum) and (
+                maximum is None or started_at <= maximum
+            ):
+                matches.append(entry)
+        return matches
+
     @staticmethod
     def _sample_stats(values):
         # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
