@@ -1082,6 +1082,74 @@ class Telemetry:
             "count": sum(counts),
         }
 
+    def counter_summary(self, name, labels=None, service=None):
+        """离线诊断：一次查看同名计数器跨系列的累加结果，只读不改状态。
+
+        name 必须可哈希，不可哈希统一抛 ValueError。service 省略或显式 None
+        匹配全部服务；提供时沿用快照筛选语义，只能是字符串，空字符串表示
+        默认服务，其他类型一律 ValueError。labels 省略或显式 None 匹配全部
+        完整标签集合；提供时沿用 inc/observe 的成对输入、键排序、重复键
+        拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空
+        标签只命中无标签序列）。全部参数校验先于任何计数器读取完成：不读
+        clock、不产生部分结果、不修改聚合状态与输入标签。
+
+        只选取名称完全相等且满足服务、标签筛选的计数器，选取顺序与快照对
+        服务、名称、标签的稳定排序一致，不受字典插入顺序影响。对每个选中
+        序列取当前 value，从数字 0 开始按该顺序逐个使用既有计数器的加法
+        语义累加：不把 value 隐式转换为 float，保留 Python 加法所得的原生
+        类型。任一值无法参与加法或加法过程抛出异常，统一抛 ValueError；
+        全部值处理完成前绝不返回部分结果。
+
+        成功返回全新字典，只含 series_count 与 value：series_count 是选中
+        序列数，value 是按确定顺序累加后的结果。没有匹配序列返回 None。
+        返回字典及其中可变值与内部状态互不共享，重复调用结果相同。整个过程
+        纯只读：不联网、不调用 clock、不修改聚合、容量或输入标签，不读取
+        快照，也不向 snapshot/json/digest/diff_snapshots 增加字段；恢复、
+        合并或批量回放产生的计数器同样可查询。
+        """
+        # 全部入站校验先于计数器读取：name 可哈希；service 沿用快照筛选语义
+        # （None 全部服务、字符串精确匹配、空串为默认服务，其他类型拒绝）；
+        # labels 省略/None 匹配全部标签集合，提供时按 inc/observe 规则归一化。
+        self._restore_hashable(name, "name")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 先按快照对 (service, name, labels) 的稳定顺序排列全部序列，再按
+        # 名称完全相等与服务、标签筛选挑出序列：相对顺序与同条件快照中同名
+        # 计数器条目逐项一致，不受字典插入顺序影响。
+        ordered_items = sorted(
+            self.counters.items(),
+            key=lambda item: _OrderableTuple(item[0]),
+        )
+        selected = []
+        for (svc, key_name, key_labels), value in ordered_items:
+            try:
+                matches = (
+                    key_name == name
+                    and (service is None or svc == service)
+                    and (labels is None or key_labels == labels)
+                )
+            except Exception as exc:
+                # 自定义标识的比较异常同样属于入参非法，统一为 ValueError。
+                raise ValueError("invalid counter_summary selector: %s" % (exc,))
+            if matches:
+                selected.append(value)
+        if not selected:  # 没有匹配序列：无汇总可言
+            return None
+        # 从数字 0 开始按快照顺序逐个使用既有计数器加法语义累加：不做任何
+        # float 转换，结果类型完全由 Python 加法决定。任一加法抛异常统一
+        # ValueError；全部值处理完才返回，绝不返回部分结果。
+        total = 0
+        for value in selected:
+            try:
+                total = total + value
+            except Exception as exc:
+                raise ValueError("counter value cannot be summed: %s" % (exc,))
+        return {
+            "series_count": len(selected),
+            "value": _isolate_mutable(total),
+        }
+
     def sample_summary(self, name, labels=None, service=None):
         """离线诊断：一次汇总同名的多条已记录样本序列，只读不改状态。
 
