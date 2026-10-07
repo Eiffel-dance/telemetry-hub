@@ -3610,6 +3610,327 @@ class TelemetrySampleSummaryTest(unittest.TestCase):
         self.assertEqual(restored.digest(), t.digest())
 
 
+class TelemetryHistogramSummaryTest(unittest.TestCase):
+    def _build(self):
+        t = Telemetry()
+        # 默认服务、无标签序列：0, 1
+        t.observe("x", 0)
+        t.observe("x", 1)
+        # 默认服务、带标签序列：2, 2, 5
+        t.observe("x", 2, labels=(("k", "v"),))
+        t.observe("x", 2, labels=(("k", "v"),))
+        t.observe("x", 5, labels=(("k", "v"),))
+        # api 服务、无标签序列：9, 10, 10.5, 11
+        for value in (9, 10, 10.5, 11):
+            t.observe("x", value, service="api")
+        # 其他名称不应混入
+        t.observe("other", 100)
+        t.observe("other", 200, service="api")
+        return t
+
+    def test_merges_same_name_series_in_snapshot_order(self):
+        t = self._build()
+        result = t.histogram_summary("x", [1, 5, 10])
+        # 拼接顺序与快照中同名序列的 values 顺序逐项一致
+        ordered_values = []
+        for record in t.snapshot()["samples"]:
+            if record["name"] == "x":
+                ordered_values.extend(record["values"])
+        self.assertEqual(
+            ordered_values, [0, 1, 2, 2, 5, 9, 10, 10.5, 11]
+        )
+        # 左开右闭：<=1: 0,1 ｜ (1,5]: 2,2,5 ｜ (5,10]: 9,10 ｜ >10: 10.5,11
+        self.assertEqual(
+            result,
+            {"boundaries": [1, 5, 10], "counts": [2, 3, 2, 2], "count": 9},
+        )
+        self.assertIsInstance(result["count"], int)
+        self.assertTrue(all(isinstance(c, int) for c in result["counts"]))
+        self.assertEqual(
+            set(result), {"boundaries", "counts", "count"}
+        )
+        # tuple 边界同样合法
+        self.assertEqual(
+            t.histogram_summary("x", (1, 5, 10)), result
+        )
+
+    def test_service_filter_none_empty_and_named(self):
+        t = self._build()
+        all_result = t.histogram_summary("x", [1, 5, 10], service=None)
+        self.assertEqual(all_result["counts"], [2, 3, 2, 2])
+        # 省略 service 与显式 None 等价
+        self.assertEqual(t.histogram_summary("x", [1, 5, 10]), all_result)
+        # 空字符串精确匹配默认服务（含带标签序列）
+        self.assertEqual(
+            t.histogram_summary("x", [1, 5, 10], service="")["counts"],
+            [2, 3, 0, 0],
+        )
+        # 具名服务精确匹配
+        self.assertEqual(
+            t.histogram_summary("x", [1, 5, 10], service="api")["counts"],
+            [0, 0, 2, 2],
+        )
+        self.assertIsNone(t.histogram_summary("x", [1], service="web"))
+        for bad in (1, 1.5, b"api", ["api"], object()):
+            with self.assertRaises(ValueError):
+                t.histogram_summary("x", [1], service=bad)
+
+    def test_labels_filter_none_empty_and_specific(self):
+        t = self._build()
+        self.assertEqual(
+            t.histogram_summary("x", [1, 5, 10], labels=None)["count"], 9
+        )
+        # 显式空标签只命中无标签序列（默认服务与 api 各一条）
+        self.assertEqual(
+            t.histogram_summary("x", [1, 5, 10], labels=())["counts"],
+            [2, 0, 2, 2],
+        )
+        # 具名标签按归一化完整集合精确匹配
+        self.assertEqual(
+            t.histogram_summary(
+                "x", [1, 5, 10], labels=(("k", "v"),)
+            )["counts"],
+            [0, 3, 0, 0],
+        )
+        # 标签输入顺序不影响匹配
+        t.observe("y", 3, labels=(("a", 1), ("b", 2)))
+        self.assertEqual(
+            t.histogram_summary(
+                "y", [0, 5], labels=(("b", 2), ("a", 1))
+            )["counts"],
+            [0, 1, 0],
+        )
+        # 没有该标签集合时返回 None
+        self.assertIsNone(
+            t.histogram_summary("x", [1], labels=(("k", "x"),))
+        )
+        # 重复键、不可严格 JSON 序列化的值统一 ValueError
+        with self.assertRaises(ValueError):
+            t.histogram_summary("x", [1], labels=(("k", 1), ("k", 2)))
+        with self.assertRaises(ValueError):
+            t.histogram_summary("x", [1], labels=(("k", float("nan")),))
+
+    def test_service_and_labels_filter_combined(self):
+        t = self._build()
+        result = t.histogram_summary("x", [1, 5, 10], labels=(), service="api")
+        self.assertEqual(result["counts"], [0, 0, 2, 2])
+        self.assertIsNone(
+            t.histogram_summary(
+                "x", [1, 5, 10], labels=(("k", "v"),), service="api"
+            )
+        )
+        self.assertIsNone(
+            t.histogram_summary("x", [1], labels=(), service="web")
+        )
+
+    def test_missing_name_and_empty_series_return_none(self):
+        t = self._build()
+        self.assertIsNone(t.histogram_summary("nope", [1]))
+        self.assertIsNone(Telemetry().histogram_summary("x", [1]))
+        # 同名序列存在但 values 全为空时不参与分桶
+        payload = {
+            "counters": [],
+            "samples": [
+                {"service": "", "name": "x", "labels": [], "values": []},
+                {
+                    "service": "api",
+                    "name": "x",
+                    "labels": [],
+                    "values": [],
+                },
+            ],
+            "spans": [],
+        }
+        self.assertIsNone(
+            Telemetry.from_snapshot(payload).histogram_summary("x", [1])
+        )
+        # 一条空、一条非空：只统计非空序列
+        payload["samples"][1]["values"] = [7]
+        result = Telemetry.from_snapshot(payload).histogram_summary("x", [5])
+        self.assertEqual(
+            result, {"boundaries": [5], "counts": [0, 1], "count": 1}
+        )
+
+    def test_counters_are_not_included(self):
+        t = Telemetry()
+        t.inc("x", 5)
+        t.inc("x", 5)
+        # 同名计数器不构成样本序列
+        self.assertIsNone(t.histogram_summary("x", [1]))
+
+    def test_unhashable_name_rejected_before_reading_samples(self):
+        t = self._build()
+        with self.assertRaises(ValueError):
+            t.histogram_summary(["x"], [1])
+        with self.assertRaises(ValueError):
+            t.histogram_summary({"a": 1}, [1])
+        # name 不可哈希时即使边界也非法，仍先抛 ValueError
+        with self.assertRaises(ValueError):
+            t.histogram_summary({}, [1, True])
+
+    def test_boundaries_validated_before_reading_samples(self):
+        t = self._build()
+        bad_boundaries = (
+            [],                       # 空列表
+            (),                       # 空元组
+            [5, 1],                   # 非递增
+            [1, 1],                   # 非严格递增
+            [1, True],                # bool
+            [False],                  # bool
+            [1, float("nan")],        # NaN
+            [1, float("inf")],        # 无穷
+            [float("-inf"), 1],       # 负无穷
+            [1, "2"],                 # 字符串
+            [1, 2j],                  # 复数
+            (0.0, -0.0),              # 0.0 与 -0.0 不严格递增
+            "abc",                    # 非 list/tuple
+            5,                        # 标量
+        )
+        for boundaries in bad_boundaries:
+            with self.assertRaises(ValueError):
+                t.histogram_summary("x", boundaries)
+
+    def test_validation_before_read_and_no_partial_result(self):
+        t = Telemetry()
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        # 不可转换的历史值：统一 ValueError，不返回部分结果
+        t.samples[("web", "lat", ())] = [4, object()]
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1])
+        # 超大整数溢出同样归一为 ValueError
+        t.samples[("web", "lat", ())] = [10 ** 400]
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1])
+        # NaN / 无穷历史值
+        t.samples[("web", "lat", ())] = [float("nan")]
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1])
+        t.samples[("web", "lat", ())] = [float("inf")]
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1])
+        # 自定义 __float__ 抛异常也统一为 ValueError
+        class ExplodingValue:
+            def __float__(self):
+                raise RuntimeError("boom")
+
+        t.samples[("web", "lat", ())] = [ExplodingValue()]
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1])
+        # 非法参数先于历史值转换：坏 service 与坏数据并存时先抛参数 ValueError
+        with self.assertRaises(ValueError):
+            t.histogram_summary("lat", [1], service=123)
+
+    def test_bucketing_is_left_open_right_closed(self):
+        t = Telemetry()
+        for value in (1, 2, 3):
+            t.observe("z", value)
+        # 恰好在边界上的值落入左侧边界对应桶（<=）
+        self.assertEqual(
+            t.histogram_summary("z", [1, 2, 3])["counts"], [1, 1, 1, 0]
+        )
+        t2 = Telemetry()
+        for value in (-2.0, -1, 0, 1.5):
+            t2.observe("z", value)
+        self.assertEqual(
+            t2.histogram_summary("z", [-1, 0])["counts"], [2, 1, 1]
+        )
+        # 单个边界只有两个桶
+        t3 = Telemetry()
+        t3.observe("s", 1)
+        t3.observe("s", 2)
+        self.assertEqual(
+            t3.histogram_summary("s", [1]),
+            {"boundaries": [1], "counts": [1, 1], "count": 2},
+        )
+
+    def test_does_not_read_clock_or_mutate_state(self):
+        class BoomClock:
+            def __call__(self):
+                raise AssertionError("clock must not be called")
+
+        t = Telemetry(BoomClock())
+        t.observe("lat", 1)
+        t.observe("lat", 2, service="api")
+        before = t.snapshot()
+        before_json = t.json()
+        before_digest = t.digest()
+        result = t.histogram_summary("lat", [1])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(t.json(), before_json)
+        self.assertEqual(t.digest(), before_digest)
+        # 输入标签与边界不被修改
+        labels = [("b", 2), ("a", 1)]
+        t.observe("tagged", 5, labels=labels)
+        t.histogram_summary("tagged", [1, 5], labels=labels)
+        self.assertEqual(labels, [("b", 2), ("a", 1)])
+        boundaries = [1, 5]
+        t.histogram_summary("tagged", boundaries)
+        self.assertEqual(boundaries, [1, 5])
+
+    def test_result_is_independent_and_repeatable(self):
+        t = self._build()
+        first = t.histogram_summary("x", [1, 5, 10])
+        second = t.histogram_summary("x", [1, 5, 10])
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["boundaries"], second["boundaries"])
+        self.assertIsNot(first["counts"], second["counts"])
+        first["boundaries"].append(999)
+        first["counts"].append(999)
+        first["count"] = 0
+        first["extra"] = "x"
+        third = t.histogram_summary("x", [1, 5, 10])
+        self.assertEqual(
+            third,
+            {"boundaries": [1, 5, 10], "counts": [2, 3, 2, 2], "count": 9},
+        )
+        self.assertNotIn("extra", third)
+
+    def test_works_after_restore_merge_and_batch(self):
+        t = self._build()
+        expected = t.histogram_summary("x", [1, 5, 10])
+        # 恢复（dict / JSON 文本）得到的样本同样可查询
+        self.assertEqual(
+            Telemetry.restore(t.snapshot()).histogram_summary("x", [1, 5, 10]),
+            expected,
+        )
+        self.assertEqual(
+            Telemetry.restore(t.json()).histogram_summary("x", [1, 5, 10]),
+            expected,
+        )
+        # 合并进当前实例后同样可查询
+        merged = Telemetry()
+        merged.merge_snapshot(t.snapshot())
+        self.assertEqual(
+            merged.histogram_summary("x", [1, 5, 10]), expected
+        )
+        # 批量回放建立的序列同样可查询
+        batched = Telemetry()
+        batched.batch(
+            [
+                {"op": "observe", "name": "x", "value": value}
+                for value in (0, 1, 2)
+            ]
+        )
+        self.assertEqual(
+            batched.histogram_summary("x", [1])["counts"], [2, 1]
+        )
+
+    def test_does_not_add_snapshot_json_or_digest_fields(self):
+        t = self._build()
+        t.histogram_summary("x", [1, 5, 10])
+        snapshot = t.snapshot()
+        self.assertEqual(set(snapshot), {"counters", "samples", "spans"})
+        for record in snapshot["samples"]:
+            self.assertNotIn("counts", record)
+        encoded = t.json()
+        self.assertNotIn("histogram_summary", encoded)
+        # digest 不受查询影响
+        self.assertEqual(t.digest(), Telemetry.restore(t.json()).digest())
+
+
 class TelemetrySpansByStartTimeTest(unittest.TestCase):
     def build(self):
         t = Telemetry(iter(range(1000)).__next__)
