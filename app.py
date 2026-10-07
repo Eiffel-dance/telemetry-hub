@@ -1227,6 +1227,77 @@ class Telemetry:
             "mean": total / count,
         }
 
+    def span_duration_percentile(
+        self, q, service=None, labels=None, status="closed"
+    ):
+        """离线诊断：对已结束跨度的耗时（end 减 start）计算分位数，只读不改状态。
+
+        只统计已经结束的跨度。status 缺省为 'closed'，只接受 'closed' 与
+        'error'：'closed' 包含所有 end 已写入的跨度（成功结束与带异常结束
+        都包含），'error' 只包含其中 error 不为 None 的跨度（0、False、
+        空容器等假值也不例外）；传入 'open' 或任何其他值（含 None 与非
+        字符串）统一抛 ValueError。service 与 labels 的筛选语义与 query
+        完全一致：service 省略或为 None 匹配全部服务，提供时只能是字符串，
+        空字符串表示默认服务；labels 省略或为 None 匹配全部标签，提供时
+        沿用 observe 的成对输入、键排序、重复键与严格 JSON 校验，按归一化
+        后的完整标签集合精确匹配（显式空标签只命中无标签跨度）。q 只接受
+        非 bool 的 int/float，必须有限且落在 [0, 100] 闭区间，否则统一抛
+        ValueError。q、service、labels 与 status 全部先校验通过，才读取
+        任何跨度：不读 clock、不产生部分结果、不改变聚合状态与调用方对象，
+        即使没有匹配跨度也不放宽校验。
+
+        候选按 query/snapshot 的稳定顺序（服务、开始时间、标识）取 closed/
+        error 筛选后的已结束跨度，未结束跨度不会进入候选，也不会被转换。
+        每个候选的 start、end 各自按现有样本统计的有限浮点规则转换后相减
+        （float(end) - float(start)）：转换失败、NaN、无穷、超大整数溢出
+        或自定义 __float__ 抛异常都统一为 ValueError，且全部候选先转换完
+        再计算，不返回部分结果。没有匹配跨度时返回 None；有数据时按耗时
+        升序，在位置 (n-1)*q/100 线性插值，位置为整数时直接取该项，q=0
+        与 q=100 分别得到最小值与最大值，结果始终是 Python float。
+
+        整个过程纯只读：不读取 clock、不联网、不修改跨度、样本、计数器、
+        输入标签或快照载荷，也不向 snapshot/json/digest 增加字段；重复调用
+        结果相同，恢复、合并或批量回放产生的跨度同样可查询。
+        """
+        # 全部入站校验先于任何跨度读取：q 必须是非 bool 的有限 int/float 且
+        # 落在 [0, 100]；status 只允许 closed/error（open 及其他任何值一律
+        # 拒绝）；service/labels 沿用 query 的筛选与归一化规则。
+        q = self._check_percentile_q(q)
+        if status not in ("closed", "error"):
+            raise ValueError("status must be 'closed' or 'error'")
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 复用跨度条目的唯一构造点：closed/error 本身就只含已结束跨度，
+        # 筛选与排序和 query/snapshot 逐项一致，未结束跨度不会进入列表。
+        entries = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, status, labels
+            )
+        ]
+        if not entries:  # 筛选后没有已结束跨度：无分位数可言
+            return None
+        # 全部候选的起止时间先按样本统计的公开浮点规则转换：任一结束跨度的
+        # 时间戳无法转为有限数值即统一 ValueError（含超大整数溢出与自定义
+        # __float__ 异常），先完成全部转换再计算分位数，保证不会边转换边
+        # 失败而产生部分结果。耗时为 end 的 float 减 start 的 float。
+        durations = []
+        for entry in entries:
+            started_at = self._finite_float(entry["start"])
+            ended_at = self._finite_float(entry["end"])
+            durations.append(ended_at - started_at)
+        # 按耗时升序后在 (n-1)*q/100 处线性插值，与 percentile 的口径一致：
+        # 整数位置（含 q=0 与 q=100）直接取该项，否则在相邻两项间插值。
+        ordered = sorted(durations)
+        position = (len(ordered) - 1) * q / 100.0
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return float(ordered[lower])
+        fraction = position - lower
+        return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
+
     @staticmethod
     def _check_duration_bound(value, name):
         # 耗时区间边界只接受非 bool 的 int/float：bool 是 int 的子类，必须
