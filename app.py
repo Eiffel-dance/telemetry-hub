@@ -517,6 +517,144 @@ class Telemetry:
         self._restore_hashable(span, "span")
         self._apply_finish(self.spans, service, span, error, self.clock)
 
+    def span(self, span, parent=None, service=None, labels=()):
+        """以普通 with 代码块记录一次完整跨度的上下文入口。
+
+        返回一个只可使用一次的上下文对象（同时作为 as 绑定的 scope）：
+        进入上下文时沿用 start 的全部入站规则（service 归一化、span 可
+        哈希、labels 成对/键序/重复键/严格 JSON 校验、重复标识拒绝与
+        容量门槛），成功后只读取一次 clock 并创建 open 记录；重复标识、
+        非法输入或容量超限分别抛 ValueError 或 TelemetryCapacityError，
+        失败不留记录也不读 clock。
+
+        正常离开 with 时只结束自己创建的跨度：沿用 finish 读取一次
+        clock、写入 end 并把 error 设为 None。代码块抛出异常时，退出
+        处理先把同一个异常对象写入 error，再完成结束并返回 False，原
+        异常继续向外传播；query/trace/snapshot/json 对异常对象的既有
+        展示与 JSON 占位规则不变。
+
+        上下文退出后再次结束或重复使用（二次进入/退出）抛 ValueError
+        且不生成第二个时间戳；结束时 clock 抛出的异常原样传播，跨度
+        保留调用 finish 前的 end（None）与 error（None）状态。上下文
+        可嵌套、可跨 service 使用，parent 只采用显式传入值，不自动
+        改写父子关系；同一实例内不同 service 的同名跨度继续隔离。
+
+        scope 暴露 span/service/parent/start/end/error 七个只读状态，
+        每次读取都基于聚合器记录生成独立快照，修改返回结果不能回写
+        聚合器。空代码块同样生成闭合跨度；新入口只复用 start/finish
+        与既有查询/快照逻辑，不改变 snapshot/json/digest/
+        diff_snapshots 的任何字段。
+        """
+        return self._SpanScope(self, span, parent, service, labels)
+
+    class _SpanScope:
+        # span() 的一次性上下文管理器：__enter__ 完全委托 start，
+        # __exit__ 完全委托 finish，因此校验顺序、容量、查重、clock
+        # 读取次数与原子性全部沿用既有入口；本类不直接触碰聚合结构。
+        # _entered 在通过复用检查后置位（对象即被消耗，start 失败也不
+        # 允许重新进入）；_started 只在 start 成功后置位（记录已存在）；
+        # _finished 在第一次有效退出前置位，保证只结束一次。
+        __slots__ = ("_telemetry", "_span", "_parent", "_service",
+                     "_labels", "_entered", "_started", "_finished")
+
+        def __init__(self, telemetry, span, parent, service, labels):
+            self._telemetry = telemetry
+            self._span = span
+            self._parent = parent
+            self._service = service
+            self._labels = labels
+            self._entered = False
+            self._started = False
+            self._finished = False
+
+        def __enter__(self):
+            # 重复进入（含退出后把同一对象再用于 with）一律拒绝，且不读
+            # clock：第一次进入时 start 命中“跨度已存在”的 ValueError，
+            # 此后的重复进入在此处直接拒绝；尚未成功进入时由 start 自身
+            # 的 service/span/labels/容量校验拒绝，同样不读 clock。
+            if self._entered:
+                raise ValueError(
+                    "span context cannot be reused: span=%r" % (self._span,)
+                )
+            self._entered = True
+            self._telemetry.start(
+                self._span,
+                parent=self._parent,
+                service=self._service,
+                labels=self._labels,
+            )
+            self._started = True
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            # 只允许结束自己创建的跨度且只结束一次：未成功进入（start 已
+            # 抛错）或已结束后的再次退出一律 ValueError，且不读取 clock、
+            # 不生成第二个时间戳。外部先以 finish/batch 结束时，委托的
+            # finish 命中“跨度已结束”的 ValueError，同样不读 clock。
+            if not self._started or self._finished:
+                raise ValueError(
+                    "span context cannot be finished twice: span=%r"
+                    % (self._span,)
+                )
+            self._finished = True
+            error = None if exc_value is None else exc_value
+            # finish 读取一次 clock 写入 end 并保存同一个异常对象；clock
+            # 自身抛出的异常原样向调用方传播，记录保持 finish 前的状态。
+            self._telemetry.finish(
+                self._span, error=error, service=self._service
+            )
+            # 代码块异常时返回 False，原异常继续向外传播；error 已先落库。
+            return False
+
+        def _record(self):
+            # scope 状态的唯一读取点：成功进入后按 (service, span) 从聚合
+            # 器取当前记录，经 _span_entry 生成独立副本，修改 scope 读到
+            # 的值不能回写聚合器；退出后仍可读取闭合状态。进入前/记录
+            # 缺失时抛 ValueError。
+            if not self._started:
+                raise ValueError(
+                    "span scope is not active yet: span=%r" % (self._span,)
+                )
+            service = self._telemetry._service(self._service)
+            record = self._telemetry.spans.get((service, self._span))
+            if record is None:  # 理论上不可达：防御性处理，不暴露内部结构
+                raise ValueError(
+                    "span record missing for service=%r span=%r"
+                    % (service, self._span)
+                )
+            return self._telemetry._span_entry(service, self._span, record)
+
+        @property
+        def span(self):
+            return self._span
+
+        @property
+        def service(self):
+            # 与聚合器一致的归一化服务：缺省为默认服务（空字符串）。
+            return self._telemetry._service(self._service)
+
+        @property
+        def parent(self):
+            return self._record()["parent"]
+
+        @property
+        def start(self):
+            return self._record()["start"]
+
+        @property
+        def end(self):
+            return self._record()["end"]
+
+        @property
+        def error(self):
+            return self._record()["error"]
+
+        @property
+        def labels(self):
+            # 与 query/trace 同形：有标签时返回可安全修改的成对列表，
+            # 无标签时为 None。不作为公开七项状态之一写入任何快照字段。
+            return self._record().get("labels")
+
     # ------------------------------------------------------------------
     # 离线批量回放
     # ------------------------------------------------------------------

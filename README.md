@@ -17,6 +17,7 @@ Tests: python3 -m unittest discover -s tests -v
 - `TelemetryCapacityError`：序列容量超限时抛出的公开异常类型，`ValueError` 的子类，既有按 `ValueError` 捕获的调用方行为不变。容量参数本身非法时仍抛普通 `ValueError`。`batch`、`restore_snapshot`、`merge_snapshot` 和 `merge_snapshots` 按同一规则检查容量并保持现有原子性：任一新序列超限，整体抛 `TelemetryCapacityError`，聚合、跨度、时钟配置和输入快照保持调用前状态，校验阶段不读 clock；快照格式错误仍抛 `SnapshotFormatError`（格式校验先于容量检查）。实例级恢复和合并沿用当前 `max_series`（`restore_snapshot`/`merge_snapshot` 不接受容量参数）；带容量创建或恢复的实例继续写入的结果与无容量全量记录完全一致。
 - 样本保留按写入顺序的原值 `values`；快照对非空样本附 `count`、`sum`（按写入顺序累加）、`minimum`、`maximum`、`mean`（`sum/count`，不四舍五入）。NaN/无穷值抛 `ValueError`，空样本不产生统计。
 - `start(span, parent=None, service=None, labels=())` / `finish(span, error=None, service=None)`：service 与跨度标识共同定位跨度；父标识原样保留。`start` 可携带可选 `labels`，标签沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，归一化只构造新结构、不改写调用方对象；标签在跨度开始时确定并随记录保存，`finish` 只结束已有的 service/span 跨度，不能改写标签。`start` 写入前先完成 service、span 与 labels 校验（service 缺省归一化为空字符串，显式传入必须是非空字符串；span 必须可哈希），相同 service/span 标识已存在跨度时——无论仍未结束还是已经结束——都抛 `ValueError`，不覆盖原有 parent/start/end/error/labels，也不推进 clock；首次创建成功时以一次 clock 结果作为 `start`，返回 `None`。`finish` 只结束当前存在且 `end` 仍为空的跨度：标识不存在或跨度已结束时抛 `ValueError`，不改变任何聚合数据、不生成新的时间戳；有效调用把 `end` 设为一次 clock 结果、把 `error` 设为传入值并返回 `None`。start/finish 收到不可哈希 span 一律抛 `ValueError`，所有被拒绝的调用都不留下半条记录，也不影响其他服务的数据。
+- `span(span, parent=None, service=None, labels=())`：以普通 `with telemetry.span(...) as scope:` 记录一次完整跨度的上下文入口，参数语义与 `start` 完全一致。进入上下文时沿用 `start` 的服务归一化、跨度可哈希性、标签校验、重复标识拒绝（`ValueError`）与容量门槛（`TelemetryCapacityError`）：成功后只读取一次 clock 并创建 open 记录；任何拒绝都不留记录也不读 clock。正常离开 `with` 时只结束自己创建的跨度，沿用 `finish` 读取一次 clock、写入 `end` 并把 `error` 设为 `None`；代码块抛出异常时，退出处理先把同一个异常对象写入 `error`，再完成结束并返回 `False`，原异常继续向外传播，query/trace/snapshot/json 对异常对象的既有展示与 JSON 占位规则不变。空代码块同样生成闭合跨度。上下文退出后再次结束或重复使用同一上下文对象抛 `ValueError` 且不生成第二个时间戳；结束时 clock 自身抛出的异常原样传播，跨度保留调用 finish 前的 `end`/`error` 状态。上下文可嵌套、可跨 service 使用，`parent` 只采用显式传入值，不自动改写父子关系；同一实例内不同 service 的同名跨度继续隔离。`scope` 提供可读取的 `span`、`service`、`parent`、`start`、`end`、`error`（有标签时另可读 `labels`），每次读取都基于聚合器记录生成独立副本，修改读取结果不能回写聚合器；上下文也可与 `finish`/`batch` 交叉使用，外部先结束时上下文退出按二次结束拒绝。新入口只复用 start/finish 与既有查询、快照逻辑，与 query、trace、耗时查询、batch 后续事件、restore、merge 的结果完全一致，继续遵守排序、标签副本、容量、原子性与不联网语义，不改变 snapshot/json/digest/diff_snapshots 的任何字段。
 - `query(status, service=None, labels=None)`：仅接受 `'open'`（`end` 为空）、`'closed'`（`end` 已写入，成功结束与带异常结束都算）和 `'error'`（已结束且 `error` 非空），其他字符串、空值或非字符串值抛 `ValueError`（拒绝时不调用 clock、不留部分结果），无匹配返回 `[]`；`service` 为可选筛选，语义与 `snapshot()`/`json()` 的服务筛选一致：省略（或显式 `None`）即不按服务限制，结果与只传 `status` 时逐项一致，提供时只能是字符串，空字符串表示默认服务，数字、字节串、列表等其他类型抛 `ValueError`；`labels` 为可选标签筛选，省略（或显式 `None`）匹配全部标签，提供时沿用 `observe` 的成对输入、键排序、重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式空序列只命中无标签记录），非法标签抛 `ValueError`，任何被拒绝的调用都不读取 clock、不改变聚合状态；结果含 `span/service/parent/start/end/error`，有标签的跨度附加可安全修改的 `labels` 字段，按服务、开始时间、标识排序；返回值为独立列表与独立记录，调用方修改不影响聚合器，`error` 原值（含异常对象）保留。
 - `trace(span, service=None)`：离线诊断用跨度树查询。service 归一化规则与 `start`/`finish` 一致，跨度标识不可哈希抛 `ValueError`；根跨度不存在返回 `None`，存在时返回独立树对象，节点含 `span/service/parent/start/end/error` 与 `children` 数组，有标签的节点附加可安全修改的 `labels` 字段，`children` 递归包含 parent 与当前节点标识精确相等且 service 相同的直接子跨度，每层按服务、开始时间、标识排序，无子节点为空数组。父标识指向其他服务或不存在的跨度按无子节点处理；从根可达的父子引用构成环时抛 `ValueError`，不返回部分树。返回对象及其列表与聚合器互不共享，查询不改动任何已有数据。
 - `trace_critical_path(span, service=None)`：离线诊断用只读关键链路查询，从一条跨度找出同服务父子树中耗时总和最大的链路。service 归一化规则与 `start`/`finish`/`trace` 一致（缺省为默认服务，显式传入必须是非空字符串），`span` 必须可哈希，参数非法统一抛 `ValueError`（拒绝发生在读取任何跨度之前，不读 clock、不留部分结果）；根跨度不存在返回 `None`。可达关系与 `trace` 完全相同：只沿同服务且 parent 与当前跨度标识精确相等的直接子节点展开，父标识指向其他服务或不存在的跨度按无子节点处理；先对根可达的整棵关系检测环，发现环抛 `ValueError` 且不返回部分结果。随后只把 `end` 已写入的跨度作为链路候选，开放节点（`end` 为空）及其后代不进入链路；根未结束，或不存在从根到已结束终点的链路时返回 `None`。所有根可达的已结束跨度（包括开放节点之下、不进入链路的已结束后代）的 `start` 与 `end` 都先按现有样本统计的有限浮点规则转换后相减，转换失败、`NaN`、无穷、超大整数溢出或自定义转换异常统一抛 `ValueError`，校验先于链路选择与任何返回完成，不返回部分结果；开放节点的时间戳不会被转换。成功时返回全新字典，只含 `span`、`service`、`duration`、`spans`：`spans` 是从根到终点的独立记录数组，字段与 `query` 一致（`span`、`service`、`parent`、`start`、`end`、`error`，有标签时附加可安全修改的 `labels`），并为每项追加该跨度的 `duration`（Python `float`，`float(end) - float(start)`）；每个节点在其可结束子链中选择耗时总和最大者，同分时取按现有服务、开始时间、标识稳定排序靠前者，无可结束子链时空链只含自身；整条链的 `duration` 是各节点 `duration` 自 `0.0` 起按 `spans` 数组顺序累加的结果。修改返回字典、记录或标签不回写聚合器，`error` 原值（含异常对象）按 `query` 保留。该入口纯只读、不联网，不写入 `snapshot`/`json`/`digest`/`diff_snapshots`，恢复、合并、`batch` 以及既有 `query`、`trace` 和所有异常行为保持不变。
@@ -37,6 +38,31 @@ Tests: python3 -m unittest discover -s tests -v
 - `batch(events)`：离线诊断数据的批量回放入口，按输入顺序一次提交，成功返回 `None`。`events` 只能是事件对象（dict）组成的列表或元组；每个事件以 `op` 指定 `inc`、`observe`、`start` 或 `finish`，其余字段沿用对应公开入口的名称（`name`/`value`/`labels`/`span`/`parent`/`error`/`service`，其中 `start` 事件可携带 `labels`）、默认值（`value=1`、`labels=()`、`parent=None`、`error=None`、`service=None`）与校验规则；批次内后续事件可以使用前面事件刚建立的跨度。空批次视为成功且不改变状态。成功提交后 `snapshot`/`json`/`query`/`trace` 的结果与按同一顺序直接调用对应入口完全一致，每个 `start`/`finish` 仍只读取一次 clock 且读取次序相同。事件不是对象、不是列表/元组、`op` 缺失或未知、字段不属于所选操作、缺失必需字段（`name`/`span`、observe 的 `value`），或事件值违反服务、标签、样本、跨度规则（含重复开始、结束不存在或已结束的跨度），统一抛 `ValueError`。提交具有原子可见性：任何事件被拒绝时计数器、样本、跨度、查询结果与后续快照保持调用前状态，且拒绝判定阶段不读取 clock；提交阶段 clock 自身抛出的异常原样向调用方传播并同样恢复调用前状态。批量入口不修改传入事件对象或其中的标签和值，也不新增快照字段。
 - `digest(service=None, labels=None, status=None)`：快照完整性指纹，用于离线诊断确认两份结果是否来自同一聚合状态。视图生成规则与 `snapshot()`/`json()` 完全一致——同一组 service/labels/status 筛选、同样的稳定排序（计数器和样本按服务、名称、标签，跨度按服务、开始时间、标识）、样本统计按原规则重算、不可严格 JSON 表示的 `error` 按 `json()` 既有规则替换为只含 type/message 的占位对象；指纹就是对该视图紧凑 JSON 文本（`sort_keys=True`、`separators=(",", ":")`）的 UTF-8 字节计算 SHA-256，返回固定 64 个字符的小写十六进制字符串。相同聚合状态与同一组筛选重复调用必然得到相同指纹；计数值、样本原值、跨度父子关系、标签、结束状态或异常内容变化后，受影响视图的指纹改变。筛选只决定哪些数组条目进入摘要，绝不写入、清空或重排聚合器，也不向 `snapshot()`/`json()` 新增字段（digest 不会出现在任何快照中）。非法筛选与 `json()` 一样在读取聚合前抛 `ValueError`；整个过程纯只读：不读取 clock、不联网、不写文件、不改写任何输入；紧凑 JSON 无法按既有 json 规则完成时统一抛 `ValueError`。
 - `Telemetry.verify_digest(payload, expected, service=None, labels=None, status=None)`：回放前校验外部快照，返回严格的 `True`/`False`。`payload` 的接受范围与 `restore` 完全一致（`snapshot()` 字典、`json()` 文本或 UTF-8 字节），遵循同一版本兼容范围：先按既有快照格式、标签、重复记录、统计一致性与跨度父子引用规则完成解析（无法恢复时抛 `SnapshotFormatError`），再以规范化后的当前视图（同一组筛选、排序、统计重算与异常占位规则）计算指纹。因此字典键顺序、标签输入顺序和可由 values 重算的样本统计字段不会造成误判。`expected` 只能是恰好 64 个字符的小写十六进制字符串，格式不合法抛 `ValueError`；非法筛选抛 `ValueError`，且 expected 格式与筛选校验先于 payload 解析。校验全部通过后摘要匹配返回 `True`，格式正确但摘要不同返回 `False`。全程不读取 clock、不联网、不写文件、不改写输入，紧凑 JSON 无法按既有 json 规则生成时统一抛 `ValueError`。
+
+## span 上下文示例
+
+```python
+t = Telemetry(iter(range(100)).__next__)
+with t.span("request", service="api", labels=(("route", "/x"),)) as scope:
+    scope.start                 # 0：进入时读取一次 clock
+    with t.span("query", parent="request", service="api"):
+        pass                    # 空代码块也生成闭合跨度
+scope.end                       # 3：退出时再读取一次 clock
+scope.error                     # None：正常结束
+
+# 代码块抛出异常：同一个异常对象先写入 error，原异常继续向外传播
+try:
+    with t.span("risky"):
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+t.query("error")[0]["error"]    # 原 RuntimeError 实例
+json.loads(t.json())["spans"]   # error 按既有规则占位：
+# {"type": "RuntimeError", "message": "boom"}
+
+with t.span("a"), t.span("b"):  # 可嵌套、可跨 service
+    pass
+```
 
 ## percentile 示例
 
