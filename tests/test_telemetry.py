@@ -3610,5 +3610,371 @@ class TelemetrySampleSummaryTest(unittest.TestCase):
         self.assertEqual(restored.digest(), t.digest())
 
 
+class TelemetrySpansByStartTimeTest(unittest.TestCase):
+    def build(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("a")                          # start 0
+        t.finish("a", error="boom")          # end 1, error
+        t.start("b", service="api")          # start 2
+        t.finish("b", service="api")         # end 3, closed 无异常
+        t.start("c", service="api")          # start 4, 仍 open
+        t.start("d", service="api", labels=(("k", "v"),))  # start 5
+        t.finish("d", service="api", error=0)             # end 6, error
+        return t
+
+    def test_default_keeps_open_spans_and_shape_is_query(self):
+        t = self.build()
+        # status 缺省保留全部跨度（含未结束的 c），排序沿用服务、start、span。
+        rows = t.spans_by_start_time()
+        self.assertEqual([e["span"] for e in rows], ["a", "b", "c", "d"])
+        for row in rows:
+            # 与 query 同形：不附加 duration 或其他派生字段。
+            self.assertIn(
+                set(row),
+                (
+                    {"span", "service", "parent", "start", "end", "error"},
+                    {"span", "service", "parent", "start", "end", "error",
+                     "labels"},
+                ),
+            )
+            self.assertNotIn("duration", row)
+        # 无标签跨度不带 labels；有标签跨度保留可修改的 labels。
+        self.assertNotIn("labels", rows[0])
+        self.assertEqual(rows[3]["labels"], [("k", "v")])
+        # 与无筛选 snapshot 的跨度数组逐项一致（同形、同序、同值）。
+        self.assertEqual(rows, t.snapshot()["spans"])
+
+    def test_closed_interval_boundaries_inclusive(self):
+        t = Telemetry(iter(range(100)).__next__)
+        for name in ("p1", "p3", "p10"):
+            t.start(name)
+            t.finish(name)
+        # p1 start 0、p3 start 2、p10 start 4
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(minimum=2, maximum=4)],
+            ["p3", "p10"],
+        )
+        # 边界闭区间：恰好等于边界的 start 被包含。
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(minimum=2, maximum=2)],
+            ["p3"],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(maximum=2)],
+            ["p1", "p3"],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(minimum=2)],
+            ["p3", "p10"],
+        )
+        # 省略两侧即无界。
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time()],
+            ["p1", "p3", "p10"],
+        )
+        # 区间内无匹配返回空列表。
+        self.assertEqual(
+            t.spans_by_start_time(minimum=2.5, maximum=3.5), []
+        )
+
+    def test_open_spans_only_have_start_validated(self):
+        t = self.build()
+        # status=open 只命中未结束的 c。
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(status="open")], ["c"]
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(status="closed")],
+            ["a", "b", "d"],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(status="error")],
+            ["a", "d"],
+        )
+        # 未结束跨度的 start 仍需转换，但其为空的 end 不被接触：
+        # 非法 start 抛错，非法 end 不影响查询。
+        x = Telemetry()
+        x.spans[("", "badstart")] = {
+            "parent": None, "start": "nope", "end": None,
+            "error": None, "labels": (),
+        }
+        with self.assertRaises(ValueError):
+            x.spans_by_start_time()
+        with self.assertRaises(ValueError):
+            x.spans_by_start_time(status="open")
+        y = Telemetry()
+        y.spans[("", "badend")] = {
+            "parent": None, "start": 1, "end": "nope",
+            "error": None, "labels": (),
+        }
+        self.assertEqual(
+            [e["span"] for e in y.spans_by_start_time()], ["badend"]
+        )
+
+    def test_status_uses_query_definitions(self):
+        t = self.build()
+        for good in (None, "open", "closed", "error"):
+            t.spans_by_start_time(status=good)
+        for bad in ("done", "", "OPEN", 0, True, b"open", ["x"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.spans_by_start_time(status=bad)
+
+    def test_bounds_must_be_non_bool_finite_int_or_float(self):
+        t = self.build()
+        for bad in (
+            True, False, "1", b"1", 1j, object(),
+            float("nan"), float("inf"), float("-inf"),
+        ):
+            with self.assertRaises(ValueError, msg=("minimum", repr(bad))):
+                t.spans_by_start_time(minimum=bad)
+            with self.assertRaises(ValueError, msg=("maximum", repr(bad))):
+                t.spans_by_start_time(maximum=bad)
+        # int（含 0、负数、超大整数）与有限 float 合法。
+        t.spans_by_start_time(minimum=0, maximum=10 ** 100)
+        t.spans_by_start_time(minimum=-5.0, maximum=0.0)
+        t.spans_by_start_time(minimum=1, maximum=1)
+
+    def test_minimum_greater_than_maximum_raises(self):
+        t = self.build()
+        for lo, hi in ((2, 1), (1.1, 1.0), (10 ** 100, 1)):
+            with self.assertRaises(ValueError, msg=(lo, hi)):
+                t.spans_by_start_time(minimum=lo, maximum=hi)
+        # 相等合法（闭区间）。
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(minimum=2, maximum=2)],
+            ["b"],
+        )
+
+    def test_service_and_labels_filters_match_query_semantics(self):
+        t = self.build()
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(service="api")],
+            ["b", "c", "d"],
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(service="")], ["a"]
+        )
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(labels=())],
+            ["a", "b", "c"],
+        )
+        self.assertEqual(
+            [e["span"]
+             for e in t.spans_by_start_time(labels=(("k", "v"),))],
+            ["d"],
+        )
+        self.assertEqual(t.spans_by_start_time(labels=(("k", "missing"),)), [])
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_start_time(
+                service="api", status="open")],
+            ["c"],
+        )
+        # 区间与筛选叠加。
+        self.assertEqual(
+            [e["span"]
+             for e in t.spans_by_start_time(service="api", minimum=3)],
+            ["c", "d"],
+        )
+
+    def test_invalid_service_and_labels_raise_valueerror(self):
+        t = self.build()
+        for bad in (1, b"api", ["api"], True, object()):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.spans_by_start_time(service=bad)
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(labels=(("k", 1), ("k", 2)))  # 重复键
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(labels=(("v", object()),))    # 不可序列化
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(labels=(("v", float("nan")),))
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(labels="bad")
+        # 全部条件先校验：区间矛盾 + 非法标签同时存在仍是 ValueError，
+        # 且即使服务本身无匹配，非法标签也在读取数据前拒绝。
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(minimum=5, maximum=1, labels="bad")
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(service="nope", labels="bad")
+
+    def test_validation_before_reading_spans_no_partial_result(self):
+        class AssertingClock:
+            reads = 0
+
+            def __call__(self):
+                self.reads += 1
+                raise AssertionError("clock must not be read")
+
+        t = self.build()
+        before = t.snapshot()
+        t.clock = AssertingClock()
+        t.spans_by_start_time()
+        t.spans_by_start_time(status="open")
+        t.spans_by_start_time(status="error")
+        t.spans_by_start_time(minimum=1.0, maximum=4.0, service="api",
+                              labels=())
+        for bad in ("done", 0, True):
+            with self.assertRaises(ValueError):
+                t.spans_by_start_time(status=bad)
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(service=1)
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(minimum=float("inf"))
+        with self.assertRaises(ValueError):
+            t.spans_by_start_time(minimum=9, maximum=1)
+        self.assertEqual(AssertingClock.reads, 0)
+        t.clock = iter(range(100)).__next__
+        self.assertEqual(t.snapshot(), before)
+
+    def test_non_finite_starts_raise_without_partial_result(self):
+        def open_span_with(start):
+            x = Telemetry()
+            x.spans[("", "s")] = {
+                "parent": None, "start": start, "end": None,
+                "error": None, "labels": (),
+            }
+            return x
+
+        for bad in ("not-a-time", float("nan"), float("inf"),
+                    float("-inf"), object(), 10 ** 400):
+            x = open_span_with(bad)
+            before = x.snapshot()
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                x.spans_by_start_time()
+            # 未结束跨度只校验 start：open 筛选同样拒绝。
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                x.spans_by_start_time(status="open")
+            self.assertEqual(x.snapshot(), before)
+
+        # 一条正常 + 一条异常：全部候选先转换，整体 ValueError 无部分结果；
+        # 即使异常跨度落在请求区间之外也一样先转换（两条都 open）。
+        x = Telemetry()
+        x.spans[("", "bad")] = {
+            "parent": None, "start": "oops", "end": None,
+            "error": None, "labels": (),
+        }
+        x.spans[("", "good")] = {
+            "parent": None, "start": 100.0, "end": None,
+            "error": None, "labels": (),
+        }
+        with self.assertRaises(ValueError):
+            x.spans_by_start_time(minimum=50.0, maximum=60.0)
+
+        # 数字字符串沿用样本浮点规则正常转换；记录保留原值。
+        x = open_span_with("4.5")
+        row = x.spans_by_start_time(minimum=4)[0]
+        self.assertEqual(row["start"], "4.5")
+
+    def test_result_is_fresh_independent_and_repeatable(self):
+        t = self.build()
+        first = t.spans_by_start_time()
+        second = t.spans_by_start_time()
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first[0], second[0])
+        self.assertIsNot(first[3]["labels"], second[3]["labels"])
+        first[1]["start"] = 999
+        first[1]["error"] = "changed"
+        first[3]["labels"].append(("z", 1))
+        first.append("junk")
+        again = t.spans_by_start_time()
+        self.assertEqual(len(again), 4)
+        self.assertEqual([e["span"] for e in again], ["a", "b", "c", "d"])
+        self.assertEqual(again[1]["start"], 2)
+        self.assertIsNone(again[1]["error"])
+        self.assertEqual(again[3]["labels"], [("k", "v")])
+
+    def test_exception_instance_error_preserved(self):
+        t = Telemetry(iter(range(2)).__next__)
+        t.start("e")
+        t.finish("e", error=ValueError("x"))
+        row = t.spans_by_start_time(status="error")[0]
+        self.assertIsInstance(row["error"], ValueError)
+        self.assertEqual(
+            json.loads(t.json(status="error"))["spans"][0]["error"],
+            {"type": "ValueError", "message": "x"},
+        )
+
+    def test_empty_aggregator_returns_empty_list(self):
+        self.assertEqual(Telemetry().spans_by_start_time(), [])
+        self.assertEqual(
+            Telemetry().spans_by_start_time(minimum=0, maximum=10), []
+        )
+
+    def test_order_follows_service_start_span(self):
+        t = Telemetry(iter([10, 12,    # api q：start 10
+                            0, 1,      # 默认服务 p：start 0
+                            2, 5,      # api a：start 2
+                            4]).__next__)  # api m：start 4，open
+        t.start("q", service="api"); t.finish("q", service="api")
+        t.start("p"); t.finish("p")
+        t.start("a", service="api"); t.finish("a", service="api")
+        t.start("m", service="api")
+        self.assertEqual(
+            [(e["service"], e["span"], e["start"])
+             for e in t.spans_by_start_time()],
+            [("", "p", 0), ("api", "a", 2), ("api", "m", 4),
+             ("api", "q", 10)],
+        )
+
+    def test_not_written_to_snapshot_json_or_digest(self):
+        t = self.build()
+        before = t.snapshot()
+        t.spans_by_start_time()
+        t.spans_by_start_time(status="error")
+        t.spans_by_start_time(minimum=0.0, maximum=100.0, service="api",
+                              labels=(("k", "v"),))
+        self.assertEqual(t.snapshot(), before)
+        self.assertEqual(set(t.snapshot()), {"counters", "samples", "spans"})
+        for record in t.snapshot()["spans"]:
+            self.assertNotIn("start_time", record)
+        payload = json.loads(t.json())
+        self.assertTrue(all("start_time" not in r for r in payload["spans"]))
+        self.assertEqual(t.digest(), Telemetry.restore(t.json()).digest())
+        # 既有 spans_by_duration 结果不受影响。
+        self.assertEqual(
+            [e["span"] for e in t.spans_by_duration()], ["a", "b", "d"]
+        )
+
+    def test_after_restore_merge_and_batch(self):
+        base = self.build()
+        expected = [(e["span"], e["start"]) for e in base.spans_by_start_time()]
+        restored = Telemetry.restore(base.json()).spans_by_start_time()
+        self.assertEqual(
+            [(e["span"], e["start"]) for e in restored], expected
+        )
+        from_snap = Telemetry.from_snapshot(
+            base.snapshot()
+        ).spans_by_start_time()
+        self.assertEqual(
+            [(e["span"], e["start"]) for e in from_snap], expected
+        )
+        merged = Telemetry()
+        self.assertIsNone(merged.merge_snapshot(base.snapshot()))
+        self.assertEqual(
+            [(e["span"], e["start"]) for e in merged.spans_by_start_time()],
+            expected,
+        )
+        # 多片合并与批量回放得到的跨度同样可按开始时间查询。
+        shard = Telemetry(iter(range(2)).__next__)
+        shard.start("z", service="shard")
+        shard.finish("z", service="shard")
+        merged.merge_snapshots([shard.snapshot()])
+        self.assertEqual(
+            [e["span"]
+             for e in merged.spans_by_start_time(service="shard")],
+            ["z"],
+        )
+        batched = Telemetry(iter(range(2)).__next__)
+        batched.batch([
+            {"op": "start", "span": "w", "service": "b"},
+            {"op": "finish", "span": "w", "service": "b"},
+        ])
+        self.assertEqual(
+            [e["span"]
+             for e in batched.spans_by_start_time(service="b")],
+            ["w"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
