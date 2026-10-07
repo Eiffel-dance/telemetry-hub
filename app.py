@@ -835,6 +835,184 @@ class Telemetry:
 
         return build(span, record)
 
+    def trace_critical_path(self, span, service=None):
+        """离线诊断：从一条跨度找出同服务父子树中耗时总和最大的链路。
+
+        service 归一化规则与 start/finish/trace 一致（缺省为默认服务，显式
+        传入必须是非空字符串），跨度标识不可哈希时抛 ValueError；两类拒绝
+        都发生在读取任何跨度之前。根跨度不存在返回 None。
+
+        可达关系与 trace 完全相同：只沿同一服务内 parent 与当前节点跨度
+        标识精确相等的直接子节点展开，父标识指向其他服务或不存在的跨度按
+        无子节点处理。先对根可达的整棵关系检测环，发现环抛 ValueError 且
+        不返回部分结果；这一遍只确定可达拓扑，不转换任何时间戳。
+
+        随后只把 end 已写入的跨度作为链路候选：开放节点（end 为空）及其
+        后代都不进入链路，因此根未结束，或不存在一条从根到已结束终点的
+        链路时返回 None。所有根可达的已结束跨度——包括开放节点之下、不
+        进入链路的已结束后代——的 start 与 end 都先按现有样本统计的有限
+        浮点规则转换（各自 float() 后相减）：转换失败、NaN、无穷、超大
+        整数溢出或自定义转换异常统一抛 ValueError，校验先于链路选择与任何
+        返回完成，绝不返回部分结果；开放节点的时间戳不会被读取转换，每个
+        已结束节点只转换一次。
+
+        返回全新字典，只含 span、service、duration、spans：span 与
+        service 为入参标识与归一化后的服务；spans 是从根到终点的独立记录
+        数组，字段与 query 一致（span、service、parent、start、end、
+        error，有标签时附加可安全修改的 labels），并为每项追加该跨度的
+        duration（end 的 float 减 start 的 float，Python float）。每个
+        节点在其可结束子链中选择耗时总和最大者继续延伸；同分时取按现有
+        服务、开始时间、标识稳定排序靠前者，无可结束子链时只含自身。整条
+        链路的 duration 是各节点 duration 自 0.0 起按 spans 数组顺序累加
+        的结果（嵌套总和受浮点结合顺序影响，因此链路 duration 严格按数组
+        顺序而非按子树归并顺序求和）。
+
+        整个过程纯只读：不读取 clock、不联网、不修改聚合与输入对象；
+        返回字典、记录与标签均为全新对象，修改返回值不回写聚合器，
+        error 原值（含异常实例）原样保留，重复调用结果一致。该入口不写入
+        snapshot/json/digest/diff_snapshots，query、trace、恢复、合并、
+        批量与容量限制的既有语义保持不变。
+        """
+        service = self._service(service)
+        self._restore_hashable(span, "span")
+        root_record = self.spans.get((service, span))
+        if root_record is None:
+            return None
+
+        # 与 trace 相同的预索引：同一服务内 parent -> 子跨度标识；不可哈希
+        # 的父标识无法精确等于任何跨度键，按无子节点处理。
+        children_by_parent = {}
+        for (child_service, child_span), child_record in self.spans.items():
+            if child_service != service:
+                continue
+            parent = child_record["parent"]
+            try:
+                children_by_parent.setdefault(parent, []).append(child_span)
+            except TypeError:
+                continue
+
+        # 第一遍：确定与 trace 完全一致的根可达拓扑，并对整棵可达关系检测
+        # 环——每个跨度只有一个父标识，重复到达即成环。只收集 (标识,
+        # 记录, 按服务/开始时间/标识排序后的直接子标识)，不转换时间戳，
+        # 因此开放节点及其子树与环的判定都不受耗时转换影响。
+        reached = {}
+        visiting = set()
+
+        def reach(node_span):
+            key = (service, node_span)
+            if key in visiting:  # 每个跨度只有一个父标识，重复到达即成环
+                raise ValueError("cycle detected in span parent references")
+            if key in reached:
+                return
+            node_record = self.spans[key]
+            visiting.add(key)
+            child_ids = [
+                child_span
+                for child_span in children_by_parent.get(node_span, ())
+            ]
+            child_ids.sort(
+                key=lambda child_span: _OrderableTuple(
+                    (
+                        service,
+                        self.spans[(service, child_span)]["start"],
+                        child_span,
+                    )
+                )
+            )
+            for child_span in child_ids:
+                reach(child_span)
+            visiting.discard(key)
+            reached[key] = child_ids
+
+        reach(span)
+
+        # 第二遍：按 trace 的稳定先根顺序遍历全部根可达跨度，对每个已结束
+        # 跨度的 start/end 做有限浮点转换并缓存 duration，开放跨度不转换。
+        # 所有可达已结束跨度（包括开放节点的已结束后代——它们不进入链路，
+        # 但按契约同样必须通过校验）全部转换成功后才进入选择阶段：任一失败
+        # 统一 ValueError，绝不产生部分结果；每个已结束节点只转换一次。
+        durations = {}
+
+        def validate(node_span):
+            key = (service, node_span)
+            node_record = self.spans[key]
+            if node_record["end"] is not None:
+                started_at = self._finite_float(node_record["start"])
+                ended_at = self._finite_float(node_record["end"])
+                durations[key] = ended_at - started_at
+            for child_span in reached[key]:
+                validate(child_span)
+
+        validate(span)
+
+        if root_record["end"] is None:
+            # 根未结束：没有以根为起点的可结束链路。校验仍已覆盖全部可达的
+            # 已结束跨度，因此这里的 None 是在全部转换成功之后才返回的。
+            return None
+
+        # 第三遍：在已校验的跨度上自叶向根做记忆化选择。开放节点（end 为
+        # 空）被剪枝——它本身及其整条后代链都不进入链路（返回 None）；
+        # 已结束节点在各直接子节点的可结束链路中挑耗时总和最大者。
+        # chosen[key] 为 None 表示该节点无可结束链路；否则为
+        # (自身 duration, 下一子节点或 None, 本节点起最长链路总和)。
+        chosen = {}
+
+        def select(key):
+            if key in chosen:
+                return chosen[key]
+            node_record = self.spans[key]
+            if node_record["end"] is None:
+                chosen[key] = None  # 开放节点：自身与后代都不进入链路
+                return None
+            own_duration = durations[key]
+            best_child = None
+            best_total = None
+            # 子节点已按服务、开始时间、标识的稳定顺序排列；严格大于才
+            # 替换，递归又带记忆化，同分时稳定排序靠前者自然胜出。
+            for child_span in reached[key]:
+                child_result = select((service, child_span))
+                if child_result is None:
+                    continue
+                child_total = child_result[2]
+                if best_total is None or child_total > best_total:
+                    best_total = child_total
+                    best_child = child_span
+            if best_total is None:
+                chain_total = own_duration
+            else:
+                chain_total = own_duration + best_total
+            result = (own_duration, best_child, chain_total)
+            chosen[key] = result
+            return result
+
+        # 根已结束且校验通过：没有可结束子链时 select 也会返回只含自身的
+        # 空链，因此根的选择结果必非 None。沿选中的下一子节点重建从根到
+        # 终点的链路；每条 _span_entry 都是与聚合器隔离的新记录（有标签时
+        # 附加可安全修改的 labels），再追加缓存的 duration，error 原值
+        # 原样保留。
+        select((service, span))
+        entries = []
+        node_span = span
+        while node_span is not None:
+            key = (service, node_span)
+            own_duration, next_child, _ = chosen[key]
+            entry = self._span_entry(service, node_span, self.spans[key])
+            entry["duration"] = own_duration
+            entries.append(entry)
+            node_span = next_child
+
+        # 链路总耗时严格按 spans 数组顺序自 0.0 累加。
+        total = 0.0
+        for entry in entries:
+            total += entry["duration"]
+
+        return {
+            "span": span,
+            "service": service,
+            "duration": total,
+            "spans": entries,
+        }
+
     def trace_summary(self, span, service=None):
         """离线诊断：只读汇总一个跨度子树的计数与耗时，不还原整棵树。
 
