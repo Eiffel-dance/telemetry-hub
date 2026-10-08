@@ -6,7 +6,7 @@ from decimal import Decimal
 from fractions import Fraction
 
 import app as appmod
-from app import SnapshotFormatError, Telemetry, TelemetryCapacityError
+from app import SnapshotFormatError, SnapshotPatchError, Telemetry, TelemetryCapacityError
 
 
 class TelemetryBehaviorTest(unittest.TestCase):
@@ -5263,6 +5263,528 @@ class TelemetrySpanContextTest(unittest.TestCase):
             {"span", "service", "parent", "start", "end", "error", "labels"},
         )
         self.assertEqual(entry["labels"], [("k", "v")])
+
+
+class TelemetryApplyDiffTest(unittest.TestCase):
+    EMPTY = {"counters": [], "samples": [], "spans": []}
+
+    @property
+    def EMPTY_PATCH(self):
+        return {
+            section: {"added": [], "removed": [], "changed": []}
+            for section in ("counters", "samples", "spans")
+        }
+
+    def build_before(self):
+        t = Telemetry(iter(range(200)).__next__)
+        t.inc("hits", 2)
+        t.inc("gone", 9, service="api")
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.start("r1")
+        t.finish("r1", error="boom")
+        t.start("open1", service="api")
+        return t
+
+    def build_after(self):
+        t = Telemetry(iter(range(200)).__next__)
+        t.inc("hits", 5)                              # counter changed
+        t.inc("new", 7)                               # counter added
+        t.observe("lat", 1, service="api")
+        t.observe("lat", 2.5, service="api")
+        t.observe("lat", "3.5", service="api")        # sample changed
+        t.start("r1")
+        t.finish("r1", error="boom")                  # identical span
+        t.start("open1", service="api")
+        t.finish("open1", service="api")              # open -> closed
+        t.start("added-span", service="web")
+        return t
+
+    def patch(self, **filters):
+        return Telemetry.diff_snapshots(
+            self.build_before().snapshot(),
+            self.build_after().snapshot(),
+            **filters
+        )
+
+    def test_error_type_is_public_valueerror_subclass(self):
+        self.assertTrue(issubclass(SnapshotPatchError, ValueError))
+        self.assertFalse(issubclass(SnapshotPatchError, SnapshotFormatError))
+
+    def test_apply_diff_roundtrip_matches_after(self):
+        before = self.build_before().snapshot()
+        after = self.build_after().snapshot()
+        patch = Telemetry.diff_snapshots(before, after)
+        self.assertEqual(Telemetry.apply_diff(before, patch), after)
+
+    def test_accepts_dict_text_and_bytes(self):
+        before_t = self.build_before()
+        after = self.build_after().snapshot()
+        patch = Telemetry.diff_snapshots(before_t.snapshot(), after)
+        variants = (
+            (before_t.snapshot(), patch),
+            (before_t.json(), json.dumps(patch)),
+            (before_t.json().encode("utf-8"),
+             json.dumps(patch).encode("utf-8")),
+            (before_t.json().encode("utf-8"), patch),
+            (before_t.snapshot(), json.dumps(patch)),
+        )
+        for raw_base, raw_patch in variants:
+            self.assertEqual(
+                Telemetry.apply_diff(raw_base, raw_patch), after
+            )
+
+    def test_empty_patch_returns_normalized_independent_copy(self):
+        t = self.build_before()
+        full = t.snapshot()
+        # 未排序、省略样本统计的等价基础快照（跨度直接沿用规范快照）
+        raw = {
+            "counters": [
+                {"service": "api", "name": "gone", "labels": [], "value": 9},
+                {"service": "", "name": "hits", "labels": [], "value": 2},
+            ],
+            "samples": [{
+                "service": "api", "name": "lat", "labels": [],
+                "values": [1, 2.5],
+            }],
+            "spans": full["spans"],
+        }
+        result = Telemetry.apply_diff(raw, self.EMPTY_PATCH)
+        self.assertEqual(result, t.snapshot())
+        self.assertIsNot(result, raw)
+        # 统计按 values 重算补齐
+        self.assertEqual(result["samples"][0]["mean"], 1.75)
+        # 结果不与输入共享
+        result["counters"][0]["value"] = 999
+        self.assertEqual(raw["counters"][1]["value"], 2)
+
+    def test_version_preserved_only_when_base_carries_supported_one(self):
+        base = self.build_before().snapshot()
+        self.assertNotIn(
+            "version", Telemetry.apply_diff(base, self.EMPTY_PATCH)
+        )
+        result = Telemetry.apply_diff(
+            dict(base, version=1), self.EMPTY_PATCH
+        )
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(
+            set(result), {"counters", "samples", "spans", "version"}
+        )
+        for bad_version in (0, 2, -1, "1", 1.0, True, None):
+            with self.assertRaises(SnapshotFormatError):
+                Telemetry.apply_diff(
+                    dict(base, version=bad_version), self.EMPTY_PATCH
+                )
+        # patch 自身不接受 version
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(
+                base, dict(self.EMPTY_PATCH, version=1)
+            )
+
+    def test_added_removed_changed_applied_to_all_sections(self):
+        result = Telemetry.apply_diff(
+            self.build_before().snapshot(), self.patch()
+        )
+        counter_values = {
+            (c["service"], c["name"]): c["value"]
+            for c in result["counters"]
+        }
+        self.assertEqual(counter_values[("", "hits")], 5)
+        self.assertEqual(counter_values[("", "new")], 7)
+        self.assertNotIn(("api", "gone"), counter_values)
+        sample = next(
+            s for s in result["samples"]
+            if s["service"] == "api" and s["name"] == "lat"
+        )
+        self.assertEqual(sample["values"], [1, 2.5, "3.5"])
+        spans = {(s["service"], s["span"]): s for s in result["spans"]}
+        self.assertNotIn(("api", "gone"), spans)
+        self.assertIsNone(spans[("web", "added-span")]["end"])
+        self.assertIsNotNone(spans[("api", "open1")]["end"])
+
+    def test_result_consumable_by_restore_and_digest_entries(self):
+        before = self.build_before().snapshot()
+        after = self.build_after().snapshot()
+        result = Telemetry.apply_diff(
+            before, Telemetry.diff_snapshots(before, after)
+        )
+        instance = Telemetry.from_snapshot(result)
+        self.assertEqual(instance.snapshot(), after)
+        Telemetry.restore(result)
+        target = Telemetry()
+        target.restore_snapshot(result)
+        self.assertEqual(target.snapshot(), after)
+        self.assertTrue(
+            Telemetry.verify_digest(result, Telemetry.restore(after).digest())
+        )
+
+    def test_service_filter_keeps_unmatched_base_records(self):
+        before = self.build_before()
+        patch = self.patch(service="api")
+        result = Telemetry.apply_diff(
+            before.snapshot(), patch, service="api"
+        )
+        values = {
+            (c["service"], c["name"]): c["value"]
+            for c in result["counters"]
+        }
+        # 视图外的默认服务计数器保持基础值，补丁不新增默认服务记录
+        self.assertEqual(values[("", "hits")], 2)
+        self.assertNotIn(("", "new"), values)
+        # 视图内：api 的 gone 被删除
+        self.assertNotIn(("api", "gone"), values)
+
+    def test_status_filter_is_view_replacement_for_spans(self):
+        before = self.build_before().snapshot()
+        patch = self.patch(status="open")
+        result = Telemetry.apply_diff(before, patch, status="open")
+        spans = {(s["service"], s["span"]): s for s in result["spans"]}
+        # open1 离开 open 视图（被删除）；added-span 作为 open 进入
+        self.assertNotIn(("api", "open1"), spans)
+        self.assertIn(("web", "added-span"), spans)
+        # 视图外的已结束 r1 原样保留
+        self.assertIn(("", "r1"), spans)
+
+    def test_labels_filter_matches_full_label_set(self):
+        t = Telemetry(iter(range(100)).__next__)
+        t.inc("m", 1, labels=(("k", "v"),))
+        t.inc("m", 2)
+        before = t.snapshot()
+        after_data = copy.deepcopy(before)
+        for record in after_data["counters"]:
+            if record["labels"] == [("k", "v")]:
+                record["value"] = 5
+        patch = Telemetry.diff_snapshots(
+            before, after_data, labels=(("k", "v"),)
+        )
+        result = Telemetry.apply_diff(
+            before, patch, labels=(("k", "v"),)
+        )
+        values = {
+            tuple(c["labels"]): c["value"] for c in result["counters"]
+        }
+        self.assertEqual(values[(("k", "v"),)], 5)
+        self.assertEqual(values[()], 2)
+
+    def test_invalid_filters_raise_plain_valueerror_before_parsing(self):
+        for kwargs in (
+            {"service": 1},
+            {"status": "nope"},
+            {"labels": (("k", float("nan")),)},
+        ):
+            with self.assertRaises(ValueError, msg=repr(kwargs)) as ctx:
+                Telemetry.apply_diff("{bad base", "{bad patch", **kwargs)
+            # 筛选校验先于解析：必须是普通 ValueError，而非格式异常
+            self.assertIs(type(ctx.exception), ValueError, kwargs)
+
+    def test_patch_operations_must_match_active_filters(self):
+        before = self.build_before().snapshot()
+        # added 记录自身不满足 service 筛选
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(
+            {"service": "zzz", "name": "m", "labels": [], "value": 1}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad, service="api")
+        # added 记录自身不满足 labels 筛选
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(
+            {"service": "", "name": "m", "labels": [["k", "v"]], "value": 1}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad, labels=())
+        # changed 的 after 离开 closed 状态视图
+        closed_span = next(
+            s for s in before["spans"] if s["span"] == "r1"
+        )
+        open_form = copy.deepcopy(closed_span)
+        open_form["end"] = None
+        bad = self.EMPTY_PATCH
+        bad["spans"]["changed"].append(
+            {"before": closed_span, "after": open_form}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad, status="closed")
+        # 试图添加基础中存在但不在视图内的定位
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(
+            next(c for c in before["counters"] if c["service"] == "")
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad, service="api")
+
+    def test_removed_must_equal_full_base_record(self):
+        before = self.build_before().snapshot()
+        bad = self.EMPTY_PATCH
+        record = copy.deepcopy(
+            next(c for c in before["counters"] if c["name"] == "gone")
+        )
+        record["value"] = 8
+        bad["counters"]["removed"].append(record)
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+        # 定位在基础中不存在同样拒绝
+        bad = self.EMPTY_PATCH
+        bad["counters"]["removed"].append(
+            {"service": "nope", "name": "x", "labels": [], "value": 1}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_changed_before_must_match_current_record(self):
+        before = self.build_before().snapshot()
+        current = next(
+            c for c in before["counters"] if c["name"] == "hits"
+        )
+        wrong_before = copy.deepcopy(current)
+        wrong_before["value"] = 1
+        after = copy.deepcopy(current)
+        after["value"] = 5
+        bad = self.EMPTY_PATCH
+        bad["counters"]["changed"].append(
+            {"before": wrong_before, "after": after}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+        # 定位在基础视图中不存在
+        bad = self.EMPTY_PATCH
+        missing = {"service": "nope", "name": "x", "labels": [], "value": 1}
+        bad["counters"]["changed"].append(
+            {"before": missing, "after": dict(missing, value=2)}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_changed_sides_must_share_locator(self):
+        before = self.build_before().snapshot()
+        current = next(c for c in before["counters"] if c["name"] == "hits")
+        drifted = copy.deepcopy(current)
+        drifted["name"] = "other"
+        bad = self.EMPTY_PATCH
+        bad["counters"]["changed"].append(
+            {"before": current, "after": drifted}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_added_locator_must_not_exist_in_view(self):
+        before = self.build_before().snapshot()
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(before["counters"][0])
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_conflicting_operations_for_same_locator_rejected(self):
+        before = self.build_before().snapshot()
+        record = before["counters"][0]
+        # added + removed 冲突
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(record)
+        bad["counters"]["removed"].append(record)
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+        # added + changed 冲突（changed 以基础记录为 before）
+        bad = self.EMPTY_PATCH
+        bad["counters"]["added"].append(record)
+        changed_after = copy.deepcopy(record)
+        changed_after["value"] += 1
+        bad["counters"]["changed"].append(
+            {"before": record, "after": changed_after}
+        )
+        with self.assertRaises(SnapshotPatchError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_patch_shape_errors_raise_snapshot_format_error(self):
+        before = self.build_before().snapshot()
+        section = {"added": [], "removed": [], "changed": []}
+        bad_patches = [
+            [],
+            None,
+            42,
+            "{not json}",
+            b"\xff not utf-8",
+            {"counters": [], "samples": [], "spans": []},
+            {"counters": {}, "samples": {}, "spans": {}},
+            {"counters": {"added": [], "removed": []},
+             "samples": section, "spans": section},
+            {"counters": {"added": [], "removed": [], "changed": [],
+                          "extra": []},
+             "samples": section, "spans": section},
+            {"counters": section, "samples": section,
+             "spans": {"added": {}, "removed": [], "changed": []}},
+            {"counters": section, "samples": section, "spans": section,
+             "version": 1},
+        ]
+        for bad in bad_patches:
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad)):
+                Telemetry.apply_diff(before, bad)
+        # changed 元素只能有 before/after
+        bad = self.EMPTY_PATCH
+        bad["counters"]["changed"].append(
+            {"before": before["counters"][0],
+             "after": before["counters"][0], "x": 1}
+        )
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(before, bad)
+        # JSON 文本层面的重复键
+        text = (
+            '{"counters":{"added":[],"added":[],"removed":[],"changed":[]},'
+            '"samples":{"added":[],"removed":[],"changed":[]},'
+            '"spans":{"added":[],"removed":[],"changed":[]}}'
+        )
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(before, text)
+
+    def test_patch_records_follow_snapshot_format_rules(self):
+        before = self.build_before().snapshot()
+        bad_cases = [
+            # 非有限样本
+            ("samples", "added",
+             {"service": "", "name": "m", "labels": [],
+              "values": [float("nan")]}),
+            # 统计与 values 不一致
+            ("samples", "added",
+             {"service": "", "name": "m", "labels": [],
+              "values": [1, 2], "count": 9}),
+            # 不可哈希跨度标识
+            ("spans", "added",
+             {"span": ["x"], "service": "", "parent": None,
+              "start": 0, "end": None, "error": None}),
+            # 非法标签
+            ("counters", "added",
+             {"service": "", "name": "c",
+              "labels": [["k", 1], ["k", 2]], "value": 1}),
+            # 记录字段不全
+            ("counters", "removed",
+             {"service": "", "name": "c", "labels": []}),
+        ]
+        for section, bucket, record in bad_cases:
+            bad = self.EMPTY_PATCH
+            bad[section][bucket].append(record)
+            with self.assertRaises(
+                SnapshotFormatError,
+                msg=(section, bucket, record),
+            ):
+                Telemetry.apply_diff(before, bad)
+        # 同一 added 桶内重复定位按重复记录拒绝
+        bad = self.EMPTY_PATCH
+        rec = {"service": "", "name": "c", "labels": [], "value": 1}
+        bad["counters"]["added"].extend([rec, dict(rec, value=2)])
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(before, bad)
+
+    def test_base_format_errors_raise_snapshot_format_error(self):
+        for bad_base in (
+            "{not json}",
+            b"\xff",
+            42,
+            {"counters": [], "samples": []},
+            {"counters": [], "samples": [], "spans": [], "extra": 1},
+            {"counters": [], "samples": [], "spans": [
+                {"span": ["x"], "service": "", "parent": None,
+                 "start": 0, "end": None, "error": None}]},
+        ):
+            with self.assertRaises(SnapshotFormatError, msg=repr(bad_base)):
+                Telemetry.apply_diff(bad_base, self.EMPTY_PATCH)
+
+    def test_result_span_links_validated_dangling_and_cycle(self):
+        before = self.build_before().snapshot()
+        # added 引入悬空父引用
+        bad = self.EMPTY_PATCH
+        bad["spans"]["added"].append(
+            {"span": "x", "service": "api", "parent": "ghost",
+             "start": 0, "end": None, "error": None}
+        )
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(before, bad)
+        # changed 制造环
+        cyclic_base = {"counters": [], "samples": [], "spans": [
+            {"span": "a", "service": "", "parent": None,
+             "start": 0, "end": 1, "error": None},
+            {"span": "b", "service": "", "parent": "a",
+             "start": 1, "end": 2, "error": None},
+        ]}
+        bad = self.EMPTY_PATCH
+        bad["spans"]["changed"].append({
+            "before": {"span": "a", "service": "", "parent": None,
+                       "start": 0, "end": 1, "error": None},
+            "after": {"span": "a", "service": "", "parent": "b",
+                      "start": 0, "end": 1, "error": None},
+        })
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(cyclic_base, bad)
+        # 同一补丁可以修复基础快照的悬空引用（校验针对结果）
+        dangling = {"counters": [], "samples": [], "spans": [
+            {"span": "x", "service": "", "parent": "ghost",
+             "start": 0, "end": None, "error": None},
+        ]}
+        repair = self.EMPTY_PATCH
+        repair["spans"]["removed"].append(dangling["spans"][0])
+        self.assertEqual(
+            Telemetry.apply_diff(dangling, repair)["spans"], []
+        )
+        repair = self.EMPTY_PATCH
+        repair["spans"]["added"].append(
+            {"span": "ghost", "service": "", "parent": None,
+             "start": -1, "end": None, "error": None}
+        )
+        repaired = Telemetry.apply_diff(dangling, repair)
+        self.assertEqual(
+            {s["span"] for s in repaired["spans"]}, {"ghost", "x"}
+        )
+
+    def test_failure_returns_nothing_and_leaves_inputs_untouched(self):
+        before = self.build_before().snapshot()
+        before_copy = copy.deepcopy(before)
+        bad = self.EMPTY_PATCH
+        bad["spans"]["added"].append(
+            {"span": "x", "service": "api", "parent": "ghost",
+             "start": 0, "end": None, "error": None}
+        )
+        patch_copy = copy.deepcopy(bad)
+        with self.assertRaises(SnapshotFormatError):
+            Telemetry.apply_diff(before, bad)
+        self.assertEqual(before, before_copy)
+        self.assertEqual(bad, patch_copy)
+
+    def test_does_not_read_clock_or_mutate_instance(self):
+        class AssertingClock:
+            def __call__(self):
+                raise AssertionError("clock must not be read")
+
+        instance = Telemetry(AssertingClock())
+        instance.restore_snapshot(self.build_before().snapshot())
+        state_before = instance.snapshot()
+        result = instance.apply_diff(
+            self.build_before().snapshot(), self.patch()
+        )
+        json.dumps(result, allow_nan=False)  # 结果严格可 JSON 序列化
+        self.assertEqual(instance.snapshot(), state_before)
+
+    def test_result_is_independent_from_inputs(self):
+        before = self.build_before().snapshot()
+        after = self.build_after().snapshot()
+        patch = Telemetry.diff_snapshots(before, after)
+        before_copy = copy.deepcopy(before)
+        patch_copy = copy.deepcopy(patch)
+        result = Telemetry.apply_diff(before, patch)
+        result["counters"][0]["value"] = 9999
+        result["spans"][0]["parent"] = ["mutated"]
+        self.assertEqual(before, before_copy)
+        self.assertEqual(patch, patch_copy)
+        self.assertEqual(
+            Telemetry.apply_diff(before_copy, patch_copy), after
+        )
+
+    def test_result_is_stably_sorted(self):
+        base = {"counters": [
+            {"service": "s2", "name": "n", "labels": [], "value": 1},
+            {"service": "s1", "name": "n", "labels": [], "value": 1},
+        ], "samples": [], "spans": []}
+        result = Telemetry.apply_diff(base, self.EMPTY_PATCH)
+        self.assertEqual(
+            [c["service"] for c in result["counters"]], ["s1", "s2"]
+        )
 
 
 if __name__ == "__main__":

@@ -148,10 +148,11 @@ class SnapshotFormatError(ValueError):
     """快照恢复格式错误的公开异常类型。
 
     所有快照恢复入口（from_snapshot/merge_snapshot/diff_snapshots/restore/
-    restore_snapshot）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失
+    restore_snapshot/apply_diff）对不可解析的 JSON、非对象顶层、不受支持的版本、缺失
     或类型错误的字段、非有限数值、无法按既有规则规范化的标签、悬空或成环
     的父子引用、重复跨度标识等输入问题统一抛出本异常。它是 ValueError 的
-    子类，既有按 ValueError 捕获的调用方行为不变。
+    子类，既有按 ValueError 捕获的调用方行为不变。apply_diff 中补丁与
+    基础视图不一致的操作则单独抛 SnapshotPatchError。
     """
 
 
@@ -165,6 +166,19 @@ class TelemetryCapacityError(ValueError):
     ValueError 捕获的调用方行为不变；批量与快照恢复/合并入口保持原子性，
     任一序列或跨度超限即整体拒绝。容量参数本身非法（非 bool 的非负整数
     以外的值）统一抛普通 ValueError。
+    """
+
+
+class SnapshotPatchError(ValueError):
+    """快照补丁应用失败的公开异常类型。
+
+    Telemetry.apply_diff 在基础快照视图上应用 diff_snapshots 同形差异时，
+    对补丁与当前视图不一致的操作统一抛出本异常：removed 记录与视图中的
+    完整记录不完全相等、changed 的 before 与当前记录不匹配或前后两侧定位
+    不一致、added 的定位在视图中已存在，或同一定位出现相互冲突的操作。
+    它是 ValueError 的子类，既有按 ValueError 捕获的调用方行为不变。
+    快照本身的格式问题仍抛 SnapshotFormatError，容量与时钟配置不参与补丁
+    应用，也不会被改变。
     """
 
 
@@ -2656,6 +2670,298 @@ class Telemetry:
         # 再深拷贝一次切断与解析中间结构的引用（条目本身已是新建对象，
         # 这里保证容器层级同样全新独立，且结果严格可 JSON 序列化）。
         return copy.deepcopy(result)
+
+    @classmethod
+    def apply_diff(cls, base, patch, service=None, labels=None, status=None):
+        """在本地把 diff_snapshots 同形的差异补丁应用到基础快照，返回新快照。
+
+        供离线恢复与继续采集使用：全程不联网、不读写文件、不读取 clock、
+        不修改任何输入或调用本方法的实例（类方法不接触任何实例状态），容量
+        与时钟配置也不参与。base 与 patch 都接受 snapshot() 字典、严格 JSON
+        文本或 UTF-8 字节；base 遵循 restore 的同一版本兼容范围（可携带受
+        支持的 version，缺省按版本 1 读取）。patch 顶层只能有 counters、
+        samples、spans 三个分区，每个分区只能有 added、removed、changed
+        三个数组；记录字段沿用快照既有规则（changed 元素只能含 before 与
+        after 两份完整记录），解析继续以 SnapshotFormatError 拒绝版本、JSON
+        重复键、重复记录、非法标签、不可哈希标识、非有限样本与统计不一致。
+
+        service/labels/status 与 diff_snapshots 完全同口径，且筛选校验先于
+        任何解析：非法筛选直接抛 ValueError。筛选只决定补丁作用的基础视图：
+        基础快照中未命中筛选的记录原样保留；补丁里的每条操作都必须命中筛选
+        （其定位落在该视图内），不允许借补丁绕过筛选改动视图外的记录，任何
+        不符合筛选的操作统一抛 SnapshotPatchError。
+
+        操作语义：removed 的完整记录必须与基础视图中同定位记录逐项相等；
+        changed 的 before 必须与当前记录完全一致，且 before 与 after 两侧
+        定位相同；added 的定位在视图中必须不存在；同一定位出现相互冲突的
+        操作也抛 SnapshotPatchError。应用成功后还会验证结果快照：样本统计
+        一律从 values 重算（补丁记录携带或省略等价统计字段都以重算为准），
+        跨度父引用必须指向同服务内存在的跨度且不得成环，任一不通过抛
+        SnapshotFormatError。最后按既有规则稳定排序，返回全新的独立快照
+        字典；base 携带受支持 version 时在结果中保留，空补丁返回基础快照
+        的规范化副本。任何失败都不返回部分结果，结果可直接交给
+        from_snapshot、restore_snapshot 或 verify_digest；既有入口的行为与
+        异常类型保持不变，也不新增任何快照字段。
+        """
+        # 筛选先校验、归一化，之后才解析任何输入，与 diff_snapshots 一致；
+        # 全过程不读 clock。
+        service = cls._filter_service(service)
+        status = cls._filter_status(status)
+        if labels is not None:
+            labels = cls._normalize_labels(labels)
+
+        # base 按严格恢复入口解析（允许受支持版本）；patch 按补丁格式解析。
+        # 两份输入先全部解析、校验完成后才应用任何操作。
+        base_data = cls._restore_parse(base)
+        patch_data = cls._restore_parse(patch)
+        base_counters, base_samples, base_spans = cls._restore_validate(
+            base_data, allow_version=True
+        )
+        patch_counters, patch_samples, patch_spans = cls._patch_validate(
+            patch_data
+        )
+
+        # 在基础内部状态的副本上应用补丁；筛选只决定每条操作允许触及的视图
+        # 定位集合，未命中筛选的基础记录原样保留。三个分区先完成全部操作与
+        # 冲突检查后才进入结果验证，任一步失败都只丢弃临时结构。
+        counters = dict(base_counters)
+        samples = dict(base_samples)
+        spans = dict(base_spans)
+        counter_keys = {
+            key for key, _ in cls._counter_snapshot_pairs(
+                base_counters, service, labels
+            )
+        }
+        sample_keys = {
+            key for key, _ in cls._sample_snapshot_pairs(
+                base_samples, service, labels
+            )
+        }
+        span_keys = {
+            key for key, _ in cls._span_snapshot_pairs(
+                base_spans, service, status, labels
+            )
+        }
+
+        # 统计重算阶段若仍遇到转换失败（如不可复现的自定义 __float__），
+        # 同样归为 SnapshotFormatError，不向外泄漏其他异常类型。
+        # 每条补丁记录都必须自身满足筛选：计数器/样本的定位键已编码服务与
+        # 标签；跨度还要核对记录内 labels 与当前 open/closed/error 状态，
+        # 防止 added 引入视图外记录或 changed 的 after 离开筛选视图。
+        def metric_matches(key, _record):
+            return (
+                (service is None or key[0] == service)
+                and (labels is None or key[2] == labels)
+            )
+
+        def span_matches(key, record):
+            if service is not None and key[0] != service:
+                return False
+            if labels is not None and record["labels"] != labels:
+                return False
+            return cls._span_matches_status(record, status)
+
+        try:
+            cls._apply_patch_section(
+                counters, counter_keys, base_counters, patch_counters,
+                metric_matches,
+            )
+            cls._apply_patch_section(
+                samples, sample_keys, base_samples, patch_samples,
+                metric_matches,
+            )
+            cls._apply_patch_section(
+                spans, span_keys, base_spans, patch_spans,
+                span_matches,
+            )
+        except ValueError as exc:
+            if isinstance(exc, SnapshotFormatError):
+                raise
+            raise SnapshotPatchError(str(exc))
+
+        # 应用后重新验证：补丁可能引入悬空或成环的父子引用；任一不通过抛
+        # SnapshotFormatError，不返回部分结果。样本统计在下面的快照构造时
+        # 一律从 values 重算。
+        cls._restore_check_span_links(spans)
+
+        # 统计重算阶段若仍遇到转换失败（如不可复现的自定义 __float__），
+        # 同样归为 SnapshotFormatError，与 diff_snapshots 保持一致，不向外
+        # 泄漏其他异常类型。
+        try:
+            result = {
+                "counters": [
+                    entry
+                    for _, entry in cls._counter_snapshot_pairs(counters)
+                ],
+                "samples": [
+                    entry
+                    for _, entry in cls._sample_snapshot_pairs(samples)
+                ],
+                "spans": [
+                    entry
+                    for _, entry in cls._span_snapshot_pairs(spans)
+                ],
+            }
+        except ValueError as exc:
+            raise SnapshotFormatError(str(exc))
+        if "version" in base_data:
+            result["version"] = base_data["version"]
+        # 深拷贝切断与解析中间结构的引用，保证返回值与输入完全独立。
+        return copy.deepcopy(result)
+
+    @classmethod
+    def _patch_validate(cls, data):
+        # 补丁顶层只能有 counters/samples/spans 三个分区（不接受 version 或
+        # 其他字段）；每个分区只能有 added/removed/changed 三个数组；changed
+        # 元素只能含 before/after。记录本身的格式交由既有快照记录规则校验。
+        if not isinstance(data, dict):
+            raise SnapshotFormatError("patch must decode to a JSON object")
+        sections = ("counters", "samples", "spans")
+        if set(data) != set(sections):
+            raise SnapshotFormatError(
+                "patch must contain exactly counters, samples and spans"
+            )
+        restore = {
+            "counters": cls._restore_counters,
+            "samples": cls._restore_samples,
+            "spans": cls._restore_spans,
+        }
+        parsed = {}
+        for section in sections:
+            bucket = data[section]
+            if not isinstance(bucket, dict) or set(bucket) != {
+                "added", "removed", "changed"
+            }:
+                raise SnapshotFormatError(
+                    "patch section %s must contain exactly added, removed"
+                    " and changed" % (section,)
+                )
+            for name in ("added", "removed", "changed"):
+                records = bucket[name]
+                if not isinstance(records, list):
+                    raise SnapshotFormatError(
+                        "patch %s.%s must be an array" % (section, name)
+                    )
+                if name == "changed":
+                    for item in records:
+                        if not isinstance(item, dict) or set(item) != {
+                            "before", "after"
+                        }:
+                            raise SnapshotFormatError(
+                                "patch changed entry must contain exactly"
+                                " before and after"
+                            )
+            # 记录按既有快照规则解析：字段、标签、可哈希标识、非有限样本与
+            # 统计一致性在此统一以 SnapshotFormatError 拒绝（同桶内重复定位
+            # 也按既有“重复记录”规则拒绝）；跨桶冲突由应用阶段处理。
+            parser = restore[section]
+            added = parser(bucket["added"])
+            removed = parser(bucket["removed"])
+            before = parser([item["before"] for item in bucket["changed"]])
+            after = parser([item["after"] for item in bucket["changed"]])
+            parsed[section] = (added, removed, before, after)
+        return (
+            parsed["counters"],
+            parsed["samples"],
+            parsed["spans"],
+        )
+
+    @classmethod
+    def _apply_patch_section(cls, state, view_keys, base_state, patch_section,
+                             record_matches):
+        # 在一个分区的基础状态副本上应用 added/removed/changed。view_keys
+        # 是命中筛选的基础定位集合：补丁操作只允许触及这些定位，或添加基础
+        # 快照中完全不存在的新定位；基础里存在但不在视图内的定位一律拒绝。
+        # record_matches 对每条补丁记录自身做筛选核对（跨度需检查记录内标签
+        # 与状态），保证 added 不会引入视图外记录、changed 的 after 不会借
+        # 补丁离开筛选视图。
+        added, removed, changed_before, changed_after = patch_section
+
+        for key, record in added.items():
+            if not record_matches(key, record):
+                raise SnapshotPatchError(
+                    "patch operation does not match the active filters"
+                )
+        for key, record in removed.items():
+            if not record_matches(key, record):
+                raise SnapshotPatchError(
+                    "patch operation does not match the active filters"
+                )
+        for key, record in changed_after.items():
+            if not record_matches(key, record):
+                raise SnapshotPatchError(
+                    "patch operation does not match the active filters"
+                )
+        # changed 的 before 与当前记录必须处在同一筛选视图；before 记录自身
+        # 也要满足筛选（与 removed 相同）。
+        for key, record in changed_before.items():
+            if not record_matches(key, record):
+                raise SnapshotPatchError(
+                    "patch operation does not match the active filters"
+                )
+
+        added_keys = set(added)
+        removed_keys = set(removed)
+        changed_keys = set(changed_after)
+        # before/after 必须成对且两侧定位相同：两份解析结果保持输入顺序，
+        # 序列不同即存在错位或缺侧。
+        if list(changed_before) != list(changed_after):
+            raise SnapshotPatchError(
+                "changed before and after must have the same locator"
+            )
+        # 同一定位跨桶出现相互冲突的操作：added/removed/changed 两两不相交。
+        if added_keys & removed_keys or added_keys & changed_keys or (
+            removed_keys & changed_keys
+        ):
+            raise SnapshotPatchError(
+                "conflicting patch operations for the same locator"
+            )
+
+        for key, record in removed.items():
+            if key not in view_keys:
+                raise SnapshotPatchError(
+                    "removed record is outside the filtered view or missing"
+                    " from base"
+                )
+            try:
+                mismatch = state[key] != record
+            except Exception as exc:
+                raise SnapshotPatchError(
+                    "patch records cannot be compared: %s" % (exc,)
+                )
+            if mismatch:
+                raise SnapshotPatchError(
+                    "removed record does not match the base record"
+                )
+            del state[key]
+        for key, record in added.items():
+            if key in view_keys:
+                raise SnapshotPatchError(
+                    "added record already exists in the filtered view"
+                )
+            if key in base_state:
+                # 定位在基础中存在但未命中筛选：不允许借补丁绕过筛选。
+                raise SnapshotPatchError(
+                    "added record is outside the filtered view"
+                )
+            state[key] = record
+        for key, after_record in changed_after.items():
+            if key not in view_keys:
+                raise SnapshotPatchError(
+                    "changed record is outside the filtered view or missing"
+                    " from base"
+                )
+            try:
+                mismatch = state[key] != changed_before[key]
+            except Exception as exc:
+                raise SnapshotPatchError(
+                    "patch records cannot be compared: %s" % (exc,)
+                )
+            if mismatch:
+                raise SnapshotPatchError(
+                    "changed before does not match the current record"
+                )
+            state[key] = after_record
 
     @staticmethod
     def _restore_pairs_hook(pairs):
