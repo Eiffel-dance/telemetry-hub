@@ -1156,6 +1156,63 @@ class Telemetry:
             "duration_mean": duration_mean,
         }
 
+    def error_summary(self, service=None, labels=None):
+        """离线诊断：按异常类型汇总已结束的异常跨度，只读不改状态。
+
+        命中规则与 query 的 error 状态完全一致：只统计 end 已写入且 error
+        不为 None 的跨度——error 为 False、0、空字符串、空列表、空字典等
+        假值同样算异常，只有 None 表示正常结束；开放跨度（end 为空）不参与
+        统计。service 省略或显式 None 匹配全部服务；提供时只能是字符串，
+        空字符串表示默认服务，其他类型一律 ValueError。labels 省略或显式
+        None 匹配全部标签集合；提供时沿用 observe 的成对输入、键排序、
+        重复键拒绝与严格 JSON 校验，按归一化后的完整标签集合精确匹配
+        （显式空标签只命中无标签跨度）。全部参数校验先于任何跨度读取完成：
+        不读 clock、不产生部分结果、不修改聚合状态与输入标签。
+
+        每条命中跨度只计一次，异常类型名称取对应 error 对象的
+        type(error).__name__——不可 JSON 序列化的异常实例也只以字符串类型
+        名参与汇总，同类异常的 count 按跨度出现次数累加。返回可直接 JSON
+        序列化的全新字典，固定形状为 {"total": 整数, "types": [{"type":
+        字符串, "count": 整数}]}：total 是命中的异常跨度总数，types 按
+        count 从大到小、再按 type 名称字典序稳定排列；没有命中时返回
+        {"total": 0, "types": []}。
+
+        整个过程纯只读：不联网、不调用 clock、不修改聚合器、容量配置或
+        输入对象，不写入 snapshot/json/digest/diff_snapshots，也不新增
+        快照字段；返回字典与其中的列表均为与内部状态隔离的新对象，调用方
+        修改结果不影响后续任何查询或写入，重复调用在状态不变时结果逐字
+        一致。start/finish、span 上下文、batch、restore 与 merge 产生的
+        跨度都按同一规则参与统计。
+        """
+        # 全部入站校验先于跨度读取：service 沿用快照筛选语义（None 全部
+        # 服务、字符串精确匹配、空串为默认服务，其他类型拒绝）；labels
+        # 省略/None 匹配全部标签集合，提供时按 observe 规则归一化。
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        counts = {}
+        total = 0
+        for (svc, _span), record in self.spans.items():
+            if service is not None and svc != service:
+                continue
+            if labels is not None and record["labels"] != labels:
+                continue
+            error = record["error"]
+            if record["end"] is None or error is None:
+                continue
+            type_name = type(error).__name__
+            counts[type_name] = counts.get(type_name, 0) + 1
+            total += 1
+        # 稳定顺序：先按 count 从大到小，再按类型名称字典序。
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return {
+            "total": total,
+            "types": [
+                {"type": type_name, "count": count}
+                for type_name, count in ordered
+            ],
+        }
+
     @staticmethod
     def _check_percentile_q(q):
         # 只接受非 bool 的 int/float：bool 是 int 的子类，必须显式排除；
