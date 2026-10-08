@@ -5265,5 +5265,407 @@ class TelemetrySpanContextTest(unittest.TestCase):
         self.assertEqual(entry["labels"], [("k", "v")])
 
 
+class TelemetryErrorSummaryTest(unittest.TestCase):
+    def _build(self):
+        t = Telemetry(iter(range(1000)).__next__)
+        t.start("a")                          # 默认服务，ValueError
+        t.finish("a", error=ValueError("bad"))
+        t.start("b", service="api")          # api，KeyError
+        t.finish("b", error=KeyError("k"), service="api")
+        t.start("c")                          # 默认服务，ValueError
+        t.finish("c", error=ValueError("again"))
+        t.start("d", service="api", labels=(("k", "v"),))  # api 带标签，0
+        t.finish("d", service="api", error=0)
+        t.start("ok")                         # 默认服务，正常结束
+        t.finish("ok")
+        t.start("open", service="api")        # api，仍开放
+        return t
+
+    def test_total_and_types_merged_by_type_name(self):
+        t = self._build()
+        summary = t.error_summary()
+        # 与 query("error") 的命中集合一致：开放跨度与正常结束不参与。
+        self.assertEqual(summary["total"], len(t.query("error")))
+        self.assertEqual(
+            summary,
+            {
+                "total": 4,
+                "types": [
+                    {"type": "ValueError", "count": 2},
+                    {"type": "KeyError", "count": 1},
+                    {"type": "int", "count": 1},
+                ],
+            },
+        )
+        self.assertEqual(set(summary), {"total", "types"})
+        self.assertIsInstance(summary["total"], int)
+        for item in summary["types"]:
+            self.assertEqual(set(item), {"type", "count"})
+            self.assertIsInstance(item["type"], str)
+            self.assertIsInstance(item["count"], int)
+
+    def test_same_error_object_on_two_spans_counts_twice(self):
+        t = Telemetry()
+        err = RuntimeError("shared")
+        t.start("s1"); t.finish("s1", error=err)
+        t.start("s2"); t.finish("s2", error=err)
+        self.assertEqual(
+            t.error_summary(),
+            {"total": 2, "types": [{"type": "RuntimeError", "count": 2}]},
+        )
+
+    def test_falsy_non_none_errors_still_count(self):
+        t = Telemetry(iter(range(100)).__next__)
+        for name, value in (
+            ("f", False), ("z", 0), ("s", ""), ("l", []), ("m", {}),
+            ("fl", 0.0),
+        ):
+            t.start(name)
+            t.finish(name, error=value)
+        t.start("none")  # None 是正常结束，不计
+        t.finish("none")
+        t.start("open")  # 开放跨度不计
+        self.assertEqual(
+            t.error_summary(),
+            {
+                "total": 6,
+                "types": [
+                    {"type": "bool", "count": 1},
+                    {"type": "dict", "count": 1},
+                    {"type": "float", "count": 1},
+                    {"type": "int", "count": 1},
+                    {"type": "list", "count": 1},
+                    {"type": "str", "count": 1},
+                ],
+            },
+        )
+
+    def test_unserializable_exception_only_type_name_enters_summary(self):
+        class Boom(Exception):
+            pass
+
+        t = Telemetry()
+        t.start("x")
+        t.finish("x", error=Boom())
+        summary = t.error_summary()
+        self.assertEqual(
+            summary, {"total": 1, "types": [{"type": "Boom", "count": 1}]}
+        )
+        # 结果可直接严格 JSON 序列化，尽管异常实例本身不可序列化。
+        json.dumps(summary, allow_nan=False)
+
+        # 非异常对象同样只取类名。
+        y = Telemetry()
+        y.start("w")
+        y.finish("w", error=object())
+        self.assertEqual(
+            y.error_summary(),
+            {"total": 1, "types": [{"type": "object", "count": 1}]},
+        )
+
+    def test_empty_aggregator_open_only_and_clean_only(self):
+        self.assertEqual(Telemetry().error_summary(), {"total": 0, "types": []})
+        open_only = Telemetry()
+        open_only.start("o")
+        self.assertEqual(open_only.error_summary(), {"total": 0, "types": []})
+        clean = Telemetry()
+        clean.start("s"); clean.finish("s")
+        self.assertEqual(clean.error_summary(), {"total": 0, "types": []})
+
+    def test_types_order_count_desc_then_name_asc(self):
+        t = Telemetry(iter(range(100)).__next__)
+        alpha = type("AlphaErr", (Exception,), {})
+        beta = type("BetaErr", (Exception,), {})
+        gamma = type("GammaErr", (Exception,), {})
+        for i, exc in enumerate((alpha(), beta(), gamma())):
+            t.start("s%d" % i)
+            t.finish("s%d" % i, error=exc)
+        # count 全为 1：按类型名字典序。
+        self.assertEqual(
+            [item["type"] for item in t.error_summary()["types"]],
+            ["AlphaErr", "BetaErr", "GammaErr"],
+        )
+        # 结果只由 count 与类型名决定，与写入交织顺序无关。
+        t2 = Telemetry(iter(range(100)).__next__)
+        for i, (name, exc) in enumerate((
+            ("g", gamma()), ("b1", beta()), ("a1", alpha()),
+            ("a2", alpha()), ("b2", beta()), ("a3", alpha()),
+        )):
+            t2.start(name)
+            t2.finish(name, error=exc)
+        self.assertEqual(
+            t2.error_summary(),
+            {
+                "total": 6,
+                "types": [
+                    {"type": "AlphaErr", "count": 3},
+                    {"type": "BetaErr", "count": 2},
+                    {"type": "GammaErr", "count": 1},
+                ],
+            },
+        )
+
+    def test_service_filter_none_empty_and_named(self):
+        t = self._build()
+        self.assertEqual(t.error_summary()["total"], 4)
+        self.assertEqual(t.error_summary(service=None)["total"], 4)
+        # 空字符串精确匹配默认服务
+        self.assertEqual(
+            t.error_summary(service=""),
+            {
+                "total": 2,
+                "types": [{"type": "ValueError", "count": 2}],
+            },
+        )
+        self.assertEqual(
+            t.error_summary(service="api"),
+            {
+                "total": 2,
+                "types": [
+                    {"type": "KeyError", "count": 1},
+                    {"type": "int", "count": 1},
+                ],
+            },
+        )
+        self.assertEqual(t.error_summary(service="web"), {"total": 0, "types": []})
+        for bad in (1, 1.5, b"api", ["api"], ("api",), object(), True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.error_summary(service=bad)
+
+    def test_labels_filter_none_empty_and_specific(self):
+        t = self._build()
+        self.assertEqual(t.error_summary(labels=None)["total"], 4)
+        # 显式空标签只命中无标签跨度
+        self.assertEqual(t.error_summary(labels=())["total"], 3)
+        self.assertEqual(
+            t.error_summary(labels=(("k", "v"),)),
+            {
+                "total": 1,
+                "types": [{"type": "int", "count": 1}],
+            },
+        )
+        # 没有该标签集合时 total 为 0
+        self.assertEqual(
+            t.error_summary(labels=(("k", "other"),)),
+            {"total": 0, "types": []},
+        )
+        # 数组标签按完整 JSON 结构精确匹配
+        x = Telemetry()
+        x.start("arr", labels=(("k", [1, 2]),))
+        x.finish("arr", error=IOError())
+        self.assertEqual(
+            x.error_summary(labels=(("k", [1, 2]),)),
+            {"total": 1, "types": [{"type": "OSError", "count": 1}]},
+        )
+        # 重复键、NaN/Infinity、不可表示值、非成对输入统一 ValueError
+        for bad in (
+            (("k", 1), ("k", 2)),
+            (("k", float("nan")),),
+            (("k", float("inf")),),
+            (("k", object()),),
+            (7,),
+            "k=v",
+            42,
+            (("a", 1, 2),),
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t.error_summary(labels=bad)
+
+    def test_service_and_labels_filter_combined(self):
+        t = self._build()
+        self.assertEqual(
+            t.error_summary(service="api", labels=(("k", "v"),)),
+            {"total": 1, "types": [{"type": "int", "count": 1}]},
+        )
+        self.assertEqual(
+            t.error_summary(service="api", labels=()),
+            {"total": 1, "types": [{"type": "KeyError", "count": 1}]},
+        )
+        self.assertEqual(
+            t.error_summary(service="web", labels=()),
+            {"total": 0, "types": []},
+        )
+
+    def test_validation_before_read_no_clock_no_partial_result(self):
+        calls = []
+
+        def clock():
+            calls.append(1)
+            return 1.0
+
+        t = Telemetry(clock=clock)
+        t.start("s"); t.finish("s", error=ValueError())
+        snapshot_before = t.snapshot()
+        reads_before = len(calls)
+        # 非法 service/labels 都在读取跨度之前拒绝：clock 不被调用，
+        # 即使两个参数同时非法也一样。
+        for kwargs in (
+            {"service": 1},
+            {"labels": (("k", 1), ("k", 2))},
+            {"service": 7, "labels": (("k", 1), ("k", 2))},
+        ):
+            with self.assertRaises(ValueError):
+                t.error_summary(**kwargs)
+        self.assertEqual(len(calls), reads_before)
+        self.assertEqual(t.snapshot(), snapshot_before)
+
+    def test_result_is_independent_and_repeatable(self):
+        t = self._build()
+        first = t.error_summary()
+        second = t.error_summary()
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["types"], second["types"])
+        for a, b in zip(first["types"], second["types"]):
+            self.assertIsNot(a, b)
+        # 修改返回字典、列表与实例不影响后续汇总与任何只读入口。
+        snapshot = t.snapshot()
+        payload = t.json()
+        digest = t.digest()
+        first["total"] = 999
+        first["types"].append({"type": "Hack", "count": 5})
+        first["types"][0]["type"] = "Hacked"
+        fresh = t.error_summary()
+        self.assertEqual(fresh["total"], 4)
+        self.assertEqual(fresh["types"][0]["type"], "ValueError")
+        self.assertFalse(
+            any(item["type"] == "Hack" for item in fresh["types"])
+        )
+        self.assertEqual(t.snapshot(), snapshot)
+        self.assertEqual(t.json(), payload)
+        self.assertEqual(t.digest(), digest)
+
+    def test_does_not_affect_writes_diff_or_other_queries(self):
+        t = self._build()
+        t.error_summary()
+        t.error_summary(service="")
+        t.error_summary(labels=())
+        # 既有只读入口的结果与字段不变。
+        self.assertEqual(
+            [e["span"] for e in t.query("error")], ["a", "c", "b", "d"]
+        )
+        tree = t.trace("a")
+        self.assertIsNotNone(tree)
+        # 修改结果后写入仍正常，后续汇总反映新状态。
+        t.start("late")
+        t.finish("late", error=TypeError())
+        self.assertEqual(
+            t.error_summary(),
+            {
+                "total": 5,
+                "types": [
+                    {"type": "ValueError", "count": 2},
+                    {"type": "KeyError", "count": 1},
+                    {"type": "TypeError", "count": 1},
+                    {"type": "int", "count": 1},
+                ],
+            },
+        )
+        # diff_snapshots 不被汇总污染（输入按既有规则使用严格 JSON 文本）。
+        before = self._build().json()
+        diff = Telemetry.diff_snapshots(before, t.json())
+        self.assertEqual(
+            [e["span"] for e in diff["spans"]["added"]], ["late"]
+        )
+
+    def test_batch_and_span_context_spans_count(self):
+        t = Telemetry(clock=lambda: 0.0)
+        t.batch([
+            {"op": "start", "span": "a"},
+            {"op": "finish", "span": "a", "error": ValueError("x")},
+            {"op": "inc", "name": "hits"},
+        ])
+        self.assertEqual(
+            t.error_summary(),
+            {"total": 1, "types": [{"type": "ValueError", "count": 1}]},
+        )
+        with t.span("clean"):
+            pass
+        try:
+            with t.span("raised"):
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        self.assertEqual(
+            t.error_summary(),
+            {
+                "total": 2,
+                "types": [
+                    {"type": "RuntimeError", "count": 1},
+                    {"type": "ValueError", "count": 1},
+                ],
+            },
+        )
+
+    def test_works_after_restore_and_merge(self):
+        source = Telemetry(clock=lambda: 0.0)
+        source.start("a")
+        source.finish("a", error="boom")          # 严格 JSON 的错误值
+        snapshot = source.snapshot()
+        text = source.json()
+        self.assertEqual(
+            Telemetry.restore(snapshot).error_summary(),
+            {"total": 1, "types": [{"type": "str", "count": 1}]},
+        )
+        self.assertEqual(
+            Telemetry.from_snapshot(text).error_summary(),
+            {"total": 1, "types": [{"type": "str", "count": 1}]},
+        )
+        merged = Telemetry(clock=lambda: 0.0)
+        merged.merge_snapshot(snapshot)
+        self.assertEqual(
+            merged.error_summary(),
+            {"total": 1, "types": [{"type": "str", "count": 1}]},
+        )
+        many = Telemetry(clock=lambda: 0.0)
+        many.merge_snapshots([snapshot, text])    # 相同跨度合并幂等
+        self.assertEqual(
+            many.error_summary(),
+            {"total": 1, "types": [{"type": "str", "count": 1}]},
+        )
+        target = Telemetry(clock=lambda: 0.0)
+        target.restore_snapshot(snapshot)
+        self.assertEqual(
+            target.error_summary(),
+            {"total": 1, "types": [{"type": "str", "count": 1}]},
+        )
+        # 恢复出的开放跨度继续结束后按同一规则参与统计。
+        opening = Telemetry(clock=iter(range(10)).__next__)
+        opening.start("o")
+        resumed = Telemetry.restore(
+            opening.snapshot(), clock=iter([9]).__next__
+        )
+        resumed.finish("o", error=LookupError())
+        self.assertEqual(
+            resumed.error_summary(),
+            {"total": 1, "types": [{"type": "LookupError", "count": 1}]},
+        )
+
+    def test_does_not_add_snapshot_or_json_fields(self):
+        t = self._build()
+        before = t.json()
+        t.error_summary()
+        t.error_summary(service="api")
+        t.error_summary(labels=())
+        self.assertEqual(t.json(), before)
+        loaded = json.loads(before)
+        self.assertEqual(set(loaded), {"counters", "samples", "spans"})
+        for entry in loaded["spans"]:
+            self.assertIn(
+                set(entry),
+                (
+                    {"span", "service", "parent", "start", "end", "error"},
+                    {"span", "service", "parent", "start", "end", "error",
+                     "labels"},
+                ),
+            )
+        # 容量与其他写入行为不受只读汇总影响。
+        capped = Telemetry(max_spans=1)
+        capped.start("a"); capped.finish("a", error=ValueError())
+        capped.error_summary()
+        with self.assertRaises(TelemetryCapacityError):
+            capped.start("b")
+
+
 if __name__ == "__main__":
     unittest.main()

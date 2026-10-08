@@ -1932,6 +1932,63 @@ class Telemetry:
                 matches.append(entry)
         return matches
 
+    def error_summary(self, service=None, labels=None):
+        """离线诊断：汇总已结束且带异常的跨度，按异常类型名合并计数。
+
+        只统计 end 已写入且 error 按 query 定义为非 None 的跨度；仍开放的
+        跨度不参与统计。error 为 False、0、空字符串或空容器等假值时仍算
+        异常，只有 None 表示正常结束。service 与 labels 的筛选语义与
+        snapshot/query 完全一致：service 缺省（None）匹配全部服务，提供
+        时只能是字符串，空字符串表示默认服务，其他类型统一抛 ValueError；
+        labels 缺省匹配全部标签，提供时沿用 observe 的成对输入、键排序、
+        重复键与严格 JSON 校验，按归一化后的完整标签集合精确匹配（显式
+        空标签只命中无标签跨度）。service 与 labels 全部先校验通过才读取
+        任何跨度：不读 clock、不产生部分结果、不改变聚合状态与调用方对象。
+
+        返回可直接 json.dumps 的独立字典，固定形状为
+        {"total": 整数, "types": [{"type": 字符串, "count": 整数}, ...]}：
+        total 是命中的异常跨度总数；types 按 type(error).__name__ 合并，
+        每个跨度只计一次，同类 count 按跨度出现次数累加，异常对象本身是
+        否可 JSON 序列化不影响汇总——只有字符串类型名参与统计。types 的
+        稳定顺序先按 count 从大到小，再按 type 名称的字典序排列；没有命中
+        时返回 {"total": 0, "types": []}。每次调用都重新构造字典、列表与
+        其中的实例，与内部状态及同次结果互不共享，调用方修改结果不影响
+        后续 snapshot、json、digest、diff_snapshots 或任何写入行为。该入口
+        纯只读、不联网、不写文件，不改变容量与快照字段；start/finish、
+        span 上下文、batch 以及 restore/merge 各入口产生的跨度按同一规则
+        参与统计，既有字段、排序、异常类型与父子关系保持不变。
+        """
+        # 全部入站校验先于任何跨度读取：service/labels 沿用 snapshot/query
+        # 的筛选与归一化规则，非法时直接 ValueError，不读 clock 也不留部分
+        # 结果。
+        service = self._filter_service(service)
+        if labels is not None:
+            labels = self._normalize_labels(labels)
+        # 复用跨度条目的唯一构造点：status="error" 本身就只含已结束且
+        # error 非 None 的跨度（0、False、空容器等假值同样命中），开放跨度
+        # 不会进入列表；筛选与排序和 query/snapshot 逐项一致。
+        entries = [
+            entry
+            for _, entry in self._span_snapshot_pairs(
+                self.spans, service, "error", labels
+            )
+        ]
+        # 每个命中跨度只按异常类名计一次；不读取也不复制 error 对象本身，
+        # 因此不可 JSON 序列化的异常也只以字符串类型名参与汇总。
+        counts = {}
+        for entry in entries:
+            type_name = type(entry["error"]).__name__
+            counts[type_name] = counts.get(type_name, 0) + 1
+        types = [
+            {"type": type_name, "count": count}
+            for type_name, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+        # 固定形状的全新字典：total 与各 count 均为 Python int，type 为
+        # Python str，整个结果可直接严格 JSON 序列化。
+        return {"total": len(entries), "types": types}
+
     @staticmethod
     def _sample_stats(values):
         # 统计重算读取既有样本：转换失败（含超大整数溢出）统一为 ValueError。
